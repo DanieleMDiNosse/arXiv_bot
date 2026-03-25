@@ -51,11 +51,11 @@ COFFEE_TEXT = os.getenv("COFFEE_TEXT", "Support this bot").strip() or "Support t
 SETTINGS_FILE = Path("bot_settings.json")
 MENU_BTN_TODAY = "Today"
 MENU_BTN_KEYWORDS = "Keywords"
-MENU_BTN_ADD_ARXIV_KEYWORD = "Add arXiv keywords"
-MENU_BTN_REMOVE_ARXIV_KEYWORD = "Remove arXiv keywords"
+MENU_BTN_ADD_ARXIV_KEYWORD = "➕ arXiv keywords"
+MENU_BTN_REMOVE_ARXIV_KEYWORD = "➖ arXiv keywords"
 MENU_BTN_CLEAR_ARXIV_KEYWORD = "Clear arXiv keywords"
-MENU_BTN_ADD_PUBMED_KEYWORD = "Add PubMed keywords"
-MENU_BTN_REMOVE_PUBMED_KEYWORD = "Remove PubMed keywords"
+MENU_BTN_ADD_PUBMED_KEYWORD = "➕ PubMed keywords"
+MENU_BTN_REMOVE_PUBMED_KEYWORD = "➖ PubMed keywords"
 MENU_BTN_CLEAR_PUBMED_KEYWORD = "Clear PubMed keywords"
 MENU_BTN_SEARCH_HOURS = "Search Hours"
 MENU_BTN_DAILY_RECAP = "Recap On/Off"
@@ -2520,56 +2520,6 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not text:
         return
 
-    if context.user_data.get("awaiting_keywords_input", False):
-        success = await apply_keywords_input(update, context, text)
-        if success:
-            context.user_data.pop("awaiting_keywords_input", None)
-        return
-
-    if context.user_data.get("awaiting_add_keyword_source", False):
-        source = str(context.user_data["awaiting_add_keyword_source"])
-        success = await apply_keywords_input_for_source(
-            update,
-            context,
-            raw=text,
-            source=source,
-            mode="add",
-        )
-        if success:
-            context.user_data.pop("awaiting_add_keyword_source", None)
-        return
-
-    if context.user_data.get("awaiting_remove_keyword_source", False):
-        source = str(context.user_data["awaiting_remove_keyword_source"])
-        success = await apply_keywords_input_for_source(
-            update,
-            context,
-            raw=text,
-            source=source,
-            mode="remove",
-        )
-        if success:
-            context.user_data.pop("awaiting_remove_keyword_source", None)
-        return
-
-    if context.user_data.get("awaiting_search_hours_input", False) or context.user_data.get("awaiting_hours_input", False):
-        try:
-            hours = int(text)
-        except ValueError:
-            await message.reply_text("Hours must be an integer.")
-            return
-        success = await apply_search_hours_input(update, context, hours)
-        if success:
-            context.user_data.pop("awaiting_search_hours_input", None)
-            context.user_data.pop("awaiting_hours_input", None)
-        return
-
-    if context.user_data.get("awaiting_recap_time_input", False):
-        success = await apply_recap_time_input(update, context, text)
-        if success:
-            context.user_data.pop("awaiting_recap_time_input", None)
-        return
-
     menu_actions = {
         MENU_BTN_TODAY.casefold(): today_cmd,
         MENU_BTN_KEYWORDS.casefold(): keywords_cmd,
@@ -2589,15 +2539,74 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         MENU_BTN_COFFEE.casefold(): coffee_cmd,
     }
 
+    pending_flags = [
+        "awaiting_keywords_input",
+        "awaiting_add_keyword_source",
+        "awaiting_remove_keyword_source",
+        "awaiting_search_hours_input",
+        "awaiting_hours_input",
+        "awaiting_recap_time_input",
+    ]
+    has_pending_action = any(context.user_data.get(flag, False) for flag in pending_flags)
+
     action = menu_actions.get(text.casefold())
-    if action is None:
-        await message.reply_text(
-            "Use the keyboard buttons below or /help.",
-            reply_markup=build_main_menu_markup(),
-        )
+    if action is not None:
+        if has_pending_action:
+            _clear_pending_input_flags(context)
+        await action(update, context)
         return
 
-    await action(update, context)
+    if context.user_data.get("awaiting_keywords_input", False):
+        await apply_keywords_input(update, context, text)
+        context.user_data.pop("awaiting_keywords_input", None)
+        return
+
+    if context.user_data.get("awaiting_add_keyword_source", False):
+        source = str(context.user_data["awaiting_add_keyword_source"])
+        await apply_keywords_input_for_source(
+            update,
+            context,
+            raw=text,
+            source=source,
+            mode="add",
+        )
+        context.user_data.pop("awaiting_add_keyword_source", None)
+        return
+
+    if context.user_data.get("awaiting_remove_keyword_source", False):
+        source = str(context.user_data["awaiting_remove_keyword_source"])
+        await apply_keywords_input_for_source(
+            update,
+            context,
+            raw=text,
+            source=source,
+            mode="remove",
+        )
+        context.user_data.pop("awaiting_remove_keyword_source", None)
+        return
+
+    if context.user_data.get("awaiting_search_hours_input", False) or context.user_data.get("awaiting_hours_input", False):
+        try:
+            hours = int(text)
+        except ValueError:
+            await message.reply_text("Hours must be an integer. Action canceled.")
+            context.user_data.pop("awaiting_search_hours_input", None)
+            context.user_data.pop("awaiting_hours_input", None)
+            return
+        await apply_search_hours_input(update, context, hours)
+        context.user_data.pop("awaiting_search_hours_input", None)
+        context.user_data.pop("awaiting_hours_input", None)
+        return
+
+    if context.user_data.get("awaiting_recap_time_input", False):
+        await apply_recap_time_input(update, context, text)
+        context.user_data.pop("awaiting_recap_time_input", None)
+        return
+
+    await message.reply_text(
+        "Use the keyboard buttons below or /help.",
+        reply_markup=build_main_menu_markup(),
+    )
 
 
 async def debugquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
