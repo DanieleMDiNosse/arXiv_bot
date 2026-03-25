@@ -61,7 +61,6 @@ MENU_BTN_SEARCH_HOURS = "Search Hours"
 MENU_BTN_DAILY_RECAP = "Recap On/Off"
 MENU_BTN_SET_RECAP_TIME = "Recap Time"
 MENU_BTN_RECAP_STATUS = "Recap Status"
-MENU_BTN_REFRESH = "Refresh"
 MENU_BTN_BOOKMARKS = "Bookmarks"
 MENU_BTN_HELP = "Help"
 MENU_BTN_COFFEE = "Pay me a coffee"
@@ -74,7 +73,7 @@ def build_main_menu_markup() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [MENU_BTN_TODAY, MENU_BTN_SEARCH_HOURS],
-            [MENU_BTN_KEYWORDS, MENU_BTN_REFRESH],
+            [MENU_BTN_KEYWORDS, MENU_BTN_BOOKMARKS],
             [
                 MENU_BTN_ADD_ARXIV_KEYWORD,
                 MENU_BTN_REMOVE_ARXIV_KEYWORD,
@@ -85,7 +84,7 @@ def build_main_menu_markup() -> ReplyKeyboardMarkup:
                 MENU_BTN_REMOVE_PUBMED_KEYWORD,
                 MENU_BTN_CLEAR_PUBMED_KEYWORD,
             ],
-            [MENU_BTN_BOOKMARKS, MENU_BTN_DAILY_RECAP],
+            [MENU_BTN_DAILY_RECAP],
             [MENU_BTN_SET_RECAP_TIME, MENU_BTN_RECAP_STATUS],
             [MENU_BTN_HELP, MENU_BTN_COFFEE],
         ],
@@ -1592,7 +1591,7 @@ async def send_daily_recap_for_user(
             chat_id=chat_id,
             text=(
                 "Daily recap skipped: no active keywords.\n"
-                "Set keywords first with /setkeywords or the menu."
+                "Set keywords first using the keyword buttons in the menu."
             ),
             reply_markup=build_main_menu_markup(),
         )
@@ -1638,7 +1637,7 @@ async def send_daily_recap_for_user(
             chat_id=chat_id,
             text=(
                 f"Recap truncated: showing {shown} of {len(papers)} papers. "
-                "Use /today to see current cached results."
+                f"Use {MENU_BTN_TODAY} to see current cached results."
             ),
             reply_markup=build_main_menu_markup(),
         )
@@ -1688,23 +1687,27 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if is_first_open:
         welcome_text = (
-            "Welcome to dailyArXiv.\n\n"
-            "This bot tracks new papers from arXiv + PubMed based on your keywords.\n"
-            "Quick start:\n"
-            "1. Add your keywords (separate lists for arXiv and PubMed).\n"
-            "2. Tap Today to see matches from the last 24 hours.\n"
-            "3. Tap Search Hours to run a custom time-window search.\n"
-            "4. Enable Daily Recap if you want automatic updates.\n\n"
-            "Tip: phrases are supported, e.g. \"decentralized finance\"."
+            "<b>Welcome to dailyArXiv</b>\n\n"
+            "This bot tracks new papers from arXiv + PubMed based on your keywords.\n\n"
+            "<b>Quick Start</b>\n"
+            f"1. Add keywords with <b>{html.escape(MENU_BTN_ADD_ARXIV_KEYWORD)}</b> and "
+            f"<b>{html.escape(MENU_BTN_ADD_PUBMED_KEYWORD)}</b>\n"
+            f"2. Tap <b>{html.escape(MENU_BTN_TODAY)}</b> for the last 24 hours\n"
+            f"3. Tap <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a custom time window\n"
+            f"4. Use <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b> and "
+            f"<b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b> for automatic updates\n\n"
+            "<b>Tip</b>: keyword phrases are supported, e.g. <code>\"quantum mechanics\"</code>."
         )
         await update.message.reply_text(
             welcome_text,
             reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
         )
 
     await update.message.reply_text(
         build_help_text(),
         reply_markup=build_main_menu_markup(),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1713,29 +1716,32 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             build_help_text(),
             reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
         )
 
 
 def build_help_text() -> str:
     return (
-        "Main actions:\n"
-        "/today - show matching papers from the last 24 hours\n"
-        "/searchhours <hours> - run a search for the last N hours\n"
-        "/keywords - show your active keyword lists (arXiv + PubMed)\n\n"
-        "Keyword actions:\n"
-        "/addkeyword <arxiv|pubmed> <kw1, kw2> - add one or more keywords\n"
-        "/removekeyword <arxiv|pubmed> <kw1, kw2> - remove one or more keywords\n"
-        "/clearkeywords [arxiv|pubmed] - clear one source list or both\n"
-        "/setkeywords arxiv <kw1, kw2> - replace arXiv keywords\n"
-        "/setkeywords pubmed <kw1, kw2> - replace PubMed keywords\n\n"
-        "Recap and utility:\n"
-        "/dailyrecap on|off|status - enable/disable daily recap or check status\n"
-        "/setrecaptime HH:MM - set daily recap time (UTC)\n"
-        "/bookmarks - show saved papers\n"
-        "/refresh - refresh sources for the 24h window\n"
-        "/debugquery - show active queries and raw counts\n"
-        "/coffee - open support link\n\n"
-        "You can also use the menu keyboard below."
+        "<b>Menu Actions</b>\n"
+        f"• <b>{html.escape(MENU_BTN_TODAY)}</b>: show matching papers from the last 24 hours\n"
+        f"• <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b>: run a custom search window\n"
+        f"• <b>{html.escape(MENU_BTN_KEYWORDS)}</b>: show active arXiv and PubMed keyword lists\n"
+        f"• <b>{html.escape(MENU_BTN_BOOKMARKS)}</b>: show saved papers\n\n"
+        "<b>Keyword Management</b>\n"
+        f"• <b>{html.escape(MENU_BTN_ADD_ARXIV_KEYWORD)}</b>: add one or more arXiv keywords\n"
+        f"• <b>{html.escape(MENU_BTN_REMOVE_ARXIV_KEYWORD)}</b>: remove one or more arXiv keywords\n"
+        f"• <b>{html.escape(MENU_BTN_CLEAR_ARXIV_KEYWORD)}</b>: clear all arXiv keywords\n"
+        f"• <b>{html.escape(MENU_BTN_ADD_PUBMED_KEYWORD)}</b>: add one or more PubMed keywords\n"
+        f"• <b>{html.escape(MENU_BTN_REMOVE_PUBMED_KEYWORD)}</b>: remove one or more PubMed keywords\n"
+        f"• <b>{html.escape(MENU_BTN_CLEAR_PUBMED_KEYWORD)}</b>: clear all PubMed keywords\n\n"
+        "<b>Recap</b>\n"
+        f"• <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b>: toggle daily recap\n"
+        f"• <b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>: set recap time in UTC (HH:MM)\n"
+        f"• <b>{html.escape(MENU_BTN_RECAP_STATUS)}</b>: show recap status and current time\n\n"
+        "<b>Other</b>\n"
+        f"• <b>{html.escape(MENU_BTN_HELP)}</b>: show this guide\n"
+        f"• <b>{html.escape(MENU_BTN_COFFEE)}</b>: open support link\n\n"
+        "<b>Tip</b>: phrase keywords are supported, e.g. <code>\"quantum mechanics\"</code>."
     )
 
 
@@ -1769,17 +1775,29 @@ async def keywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data,
         user_id=user_id,
     )
-    arxiv_body = "\n".join(f"- {k}" for k in arxiv_keywords) if arxiv_keywords else "(none)"
-    pubmed_body = "\n".join(f"- {k}" for k in pubmed_keywords) if pubmed_keywords else "(none)"
+    arxiv_body = (
+        "\n".join(f"- {html.escape(k)}" for k in arxiv_keywords)
+        if arxiv_keywords
+        else "(none)"
+    )
+    pubmed_body = (
+        "\n".join(f"- {html.escape(k)}" for k in pubmed_keywords)
+        if pubmed_keywords
+        else "(none)"
+    )
 
     if update.message:
         await update.message.reply_text(
-            f"Today window: last {TODAY_HOURS_BACK} hours\n"
-            f"arXiv keywords:\n{arxiv_body}\n\n"
-            f"PubMed keywords:\n{pubmed_body}\n\n"
-            "Use Search Hours to run a custom time window.\n"
-            "Tip: for phrases use quotes, e.g. \"decentralized finance\".",
+            "<b>Active Keywords</b>\n\n"
+            f"<b>Today window</b>: last {TODAY_HOURS_BACK} hours\n\n"
+            "<b>arXiv</b>\n"
+            f"<pre>{arxiv_body}</pre>\n\n"
+            "<b>PubMed</b>\n"
+            f"<pre>{pubmed_body}</pre>\n\n"
+            f"Use <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a custom time window.\n"
+            "Tip: phrase keywords are supported, e.g. <code>\"quantum mechanics\"</code>.",
             reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -1797,13 +1815,13 @@ async def prompt_setkeywords_input(update: Update, context: ContextTypes.DEFAULT
     context.user_data["awaiting_keywords_input"] = True
     if update.message:
         await update.message.reply_text(
-            "Send keywords as comma-separated values.\n"
-            "This sets BOTH arXiv and PubMed keyword lists.\n"
-            "Example: dark matter, dna, cancer\n"
-            "For a single source use:\n"
-            "/setkeywords arxiv ...\n"
-            "/setkeywords pubmed ...",
+            "<b>Set Keywords (Both Sources)</b>\n\n"
+            "Send keywords as comma-separated values.\n\n"
+            "<b>Example</b>\n"
+            "<code>astronomy, climate change, photosynthesis</code>\n\n"
+            "To edit one source only, use the dedicated Add, Remove and Clear buttons.",
             reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -1817,13 +1835,15 @@ async def prompt_add_keyword_for_source(
     source_label = paper_source_label(source)
     if update.message:
         await update.message.reply_text(
-            f"Send one or more keywords to add to {source_label}.\n"
-            "Use commas to separate multiple values.\n"
-            "Examples:\n"
-            "decentralized finance\n"
-            "defi, ethereum, solana\n"
-            "\"decentralized finance\" sepsis",
+            f"<b>Add Keywords • {html.escape(source_label)}</b>\n\n"
+            "Send one or more keywords to add.\n"
+            "Use commas to separate multiple values.\n\n"
+            "<b>Examples</b>\n"
+            "<code>quantum mechanics</code>\n"
+            "<code>astronomy, climate change, photosynthesis</code>\n"
+            "<code>\"quantum mechanics\" astronomy</code>",
             reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -1838,15 +1858,19 @@ async def prompt_remove_keyword_for_source(
     user_id = _get_user_id(update)
     current = get_keywords_for_source(source, context.user_data, user_id=user_id)
     body = "\n".join(f"- {k}" for k in current) if current else "(none)"
+    body_html = html.escape(body)
     if update.message:
         await update.message.reply_text(
-            f"Send one or more keywords to remove from {source_label}.\n"
-            "Use commas to separate multiple values.\n"
-            f"Current list:\n{body}\n\n"
-            "Examples:\n"
-            "sepsis\n"
-            "sepsis, septic shock",
+            f"<b>Remove Keywords • {html.escape(source_label)}</b>\n\n"
+            "Send one or more keywords to remove.\n"
+            "Use commas to separate multiple values.\n\n"
+            "<b>Current list</b>\n"
+            f"<pre>{body_html}</pre>\n"
+            "<b>Examples</b>\n"
+            "<code>astronomy</code>\n"
+            "<code>astronomy, photosynthesis</code>",
             reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -1879,9 +1903,12 @@ async def prompt_searchhours_input(update: Update, context: ContextTypes.DEFAULT
     context.user_data["awaiting_search_hours_input"] = True
     if update.message:
         await update.message.reply_text(
-            "How many hours back do you want to search?\n"
-            "Example: 72",
+            "<b>Search Hours</b>\n\n"
+            "How many hours back do you want to search?\n\n"
+            "<b>Example</b>\n"
+            "<code>72</code>",
             reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -2166,7 +2193,10 @@ async def setkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if len(context.args) < 2:
             if update.message:
                 await update.message.reply_text(
-                    "Usage:\n/setkeywords arxiv kw1, kw2\n/setkeywords pubmed kw1, kw2",
+                    "Format:\n"
+                    "arxiv kw1, kw2\n"
+                    "pubmed kw1, kw2\n\n"
+                    f"You can also use {MENU_BTN_ADD_ARXIV_KEYWORD} or {MENU_BTN_ADD_PUBMED_KEYWORD}.",
                     reply_markup=build_main_menu_markup(),
                 )
             return
@@ -2229,7 +2259,10 @@ async def clearkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if context.args and source is None:
         if update.message:
             await update.message.reply_text(
-                "Usage:\n/clearkeywords\n/clearkeywords arxiv\n/clearkeywords pubmed",
+                "Choose one source to clear:\n"
+                "- arxiv\n"
+                "- pubmed\n\n"
+                "Or use the clear buttons in the menu.",
                 reply_markup=build_main_menu_markup(),
             )
         return
@@ -2272,10 +2305,11 @@ async def addkeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if len(context.args) < 2:
         if update.message:
             await update.message.reply_text(
-                "Usage:\n"
-                "/addkeyword arxiv decentralized finance\n"
-                "/addkeyword arxiv defi, ethereum, solana\n"
-                "/addkeyword pubmed sepsis",
+                "Format:\n"
+                "arxiv quantum mechanics\n"
+                "arxiv astronomy, climate change, photosynthesis\n"
+                "pubmed genetics\n\n"
+                f"Or use {MENU_BTN_ADD_ARXIV_KEYWORD} / {MENU_BTN_ADD_PUBMED_KEYWORD}.",
                 reply_markup=build_main_menu_markup(),
             )
         return
@@ -2301,10 +2335,11 @@ async def removekeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if len(context.args) < 2:
         if update.message:
             await update.message.reply_text(
-                "Usage:\n"
-                "/removekeyword arxiv decentralized finance\n"
-                "/removekeyword arxiv defi, ethereum\n"
-                "/removekeyword pubmed sepsis",
+                "Format:\n"
+                "arxiv quantum mechanics\n"
+                "arxiv astronomy, photosynthesis\n"
+                "pubmed genetics\n\n"
+                f"Or use {MENU_BTN_REMOVE_ARXIV_KEYWORD} / {MENU_BTN_REMOVE_PUBMED_KEYWORD}.",
                 reply_markup=build_main_menu_markup(),
             )
         return
@@ -2364,7 +2399,7 @@ async def dailyrecap_status_cmd(update: Update, context: ContextTypes.DEFAULT_TY
             f"- Status: {status}\n"
             f"- Time (UTC): {recap_time}\n"
             f"- Chat ID: {chat_label}\n\n"
-            "Use /dailyrecap on|off and /setrecaptime HH:MM.",
+            f"Use {MENU_BTN_DAILY_RECAP} and {MENU_BTN_SET_RECAP_TIME}.",
             reply_markup=build_main_menu_markup(),
         )
 
@@ -2374,9 +2409,12 @@ async def prompt_setrecaptime_input(update: Update, context: ContextTypes.DEFAUL
     context.user_data["awaiting_recap_time_input"] = True
     if update.message:
         await update.message.reply_text(
-            "Send recap time in UTC as HH:MM.\n"
-            "Example: 09:30",
+            "<b>Set Recap Time</b>\n\n"
+            "Send recap time in UTC as HH:MM.\n\n"
+            "<b>Example</b>\n"
+            "<code>09:30</code>",
             reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -2395,7 +2433,11 @@ async def apply_recap_time_input(
     recap_time = parse_daily_recap_time(raw)
     if recap_time is None:
         if update.message:
-            await update.message.reply_text("Invalid time format. Use HH:MM (UTC), e.g. 09:30.")
+            await update.message.reply_text(
+                "Invalid time format.\n"
+                "Use HH:MM in UTC.\n"
+                "Example: 09:30."
+            )
         return False
 
     _save_user_setting(user_id, "daily_recap_time", recap_time)
@@ -2506,7 +2548,7 @@ async def dailyrecap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if update.message:
         await update.message.reply_text(
-            "Usage:\n/dailyrecap on\n/dailyrecap off\n/dailyrecap status",
+            f"Use {MENU_BTN_DAILY_RECAP} to toggle recap and {MENU_BTN_RECAP_STATUS} to check status.",
             reply_markup=build_main_menu_markup(),
         )
 
@@ -2533,7 +2575,6 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         MENU_BTN_DAILY_RECAP.casefold(): toggledailyrecap_cmd,
         MENU_BTN_SET_RECAP_TIME.casefold(): prompt_setrecaptime_input,
         MENU_BTN_RECAP_STATUS.casefold(): dailyrecap_status_cmd,
-        MENU_BTN_REFRESH.casefold(): refresh_cmd,
         MENU_BTN_BOOKMARKS.casefold(): bookmarks_cmd,
         MENU_BTN_HELP.casefold(): help_cmd,
         MENU_BTN_COFFEE.casefold(): coffee_cmd,
@@ -2604,7 +2645,7 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     await message.reply_text(
-        "Use the keyboard buttons below or /help.",
+        "Use the keyboard buttons below.",
         reply_markup=build_main_menu_markup(),
     )
 
@@ -2653,29 +2694,8 @@ async def debugquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(
-            f"Refreshing paper sources for the last {TODAY_HOURS_BACK} hours..."
-        )
-
-    try:
-        papers = await refresh_cache(update, context, hours_back=TODAY_HOURS_BACK)
-    except Exception as exc:
-        logger.exception("Refresh failed")
-        if update.message:
-            await update.message.reply_text(f"Refresh failed:\n{exc}")
-        return
-
-    raw_count = context.user_data.get("last_raw_entry_count", 0)
-    raw_breakdown = context.user_data.get("last_raw_entry_breakdown", {})
-    arxiv_raw = int(raw_breakdown.get("arxiv", 0) or 0) if isinstance(raw_breakdown, dict) else 0
-    pubmed_raw = int(raw_breakdown.get("pubmed", 0) or 0) if isinstance(raw_breakdown, dict) else 0
-    if update.message:
-        await update.message.reply_text(
-            "Refresh complete. "
-            f"Raw entries: {raw_count} (arXiv: {arxiv_raw}, PubMed: {pubmed_raw}). "
-            f"Matching papers in last {TODAY_HOURS_BACK}h: {len(papers)}."
-        )
+    # Backward-compatible alias: refresh now behaves exactly like Today.
+    await today_cmd(update, context)
 
 
 async def run_search_for_hours(
@@ -2705,16 +2725,15 @@ async def run_search_for_hours(
         if not query:
             text = (
                 "No active query is set.\n\n"
-                "Use /setkeywords to define one or more keywords.\n"
-                "Example:\n"
-                "/setkeywords cancer, dna, dark matter"
+                f"Use {MENU_BTN_ADD_ARXIV_KEYWORD} and {MENU_BTN_ADD_PUBMED_KEYWORD} "
+                "to define your keywords."
             )
         else:
             text = (
                 f"No matching papers found in the last {hours_back} hours.\n"
                 f"Raw entries fetched: {raw_count} "
                 f"(arXiv: {arxiv_raw}, PubMed: {pubmed_raw})\n\n"
-                "Use /debugquery to inspect the current query."
+                f"Adjust keywords via {MENU_BTN_KEYWORDS} and try again."
             )
 
         if update.message:
@@ -2747,7 +2766,7 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update=update,
         context=context,
         hours_back=TODAY_HOURS_BACK,
-        force_refresh=False,
+        force_refresh=True,
     )
 
 
@@ -2805,7 +2824,7 @@ async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if paper is None:
         await query.answer(
-            "This paper is no longer in your current list. Run /today again.",
+            f"This paper is no longer in your current list. Run {MENU_BTN_TODAY} again.",
             show_alert=True,
         )
         return
@@ -2907,7 +2926,7 @@ async def bookmarks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not bookmark_ids:
         if update.message:
             await update.message.reply_text(
-                "No bookmarks yet. Use ⭐ on a paper from /today.",
+                f"No bookmarks yet. Use ⭐ on a paper from {MENU_BTN_TODAY}.",
                 reply_markup=build_main_menu_markup(),
             )
         return
