@@ -28,6 +28,19 @@
         "determinant",
         "column selection"
       ]
+    },
+    "373851206": {
+      "custom_keywords_arxiv": [
+        "Llm",
+        "Physics"
+      ],
+      "daily_recap_times": [
+        "08:30"
+      ],
+      "daily_recap_time": "08:30",
+      "daily_recap_timezone": "Europe/Rome",
+      "daily_recap_chat_id": 373851206,
+      "daily_recap_enabled": true
     }
   },
   "hours_back": 24

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, List, Optional, Sequence
+from zoneinfo import ZoneInfo, available_timezones
 
 import feedparser
 import requests
@@ -43,9 +44,11 @@ DEFAULT_MAX_RESULTS = int(os.getenv("MAX_RESULTS", "300"))
 TODAY_HOURS_BACK = 24
 DAILY_RECAP_HOURS = 24
 DEFAULT_DAILY_RECAP_TIME = "09:00"
+DEFAULT_DAILY_RECAP_TIMEZONE = "UTC"
 MAX_DAILY_RECAP_ITEMS = int(os.getenv("DAILY_RECAP_MAX_ITEMS", "20"))
 MAX_ABSTRACT_CHARS = int(os.getenv("MAX_ABSTRACT_CHARS", "1600"))
 PUBMED_FUTURE_GRACE_DAYS = int(os.getenv("PUBMED_FUTURE_GRACE_DAYS", "2"))
+RECAP_TIMEZONE_PAGE_SIZE = max(1, int(os.getenv("RECAP_TIMEZONE_PAGE_SIZE", "8")))
 COFFEE_URL = os.getenv("COFFEE_URL", "").strip()
 COFFEE_TEXT = os.getenv("COFFEE_TEXT", "Support this bot").strip() or "Support this bot"
 SETTINGS_FILE = Path("bot_settings.json")
@@ -67,6 +70,11 @@ MENU_BTN_COFFEE = "Pay me a coffee"
 SOURCE_ARXIV = "arxiv"
 SOURCE_PUBMED = "pubmed"
 WELCOME_SHOWN_AT_KEY = "welcome_shown_at"
+SEARCH_SCOPE_TODAY = "today"
+SEARCH_SCOPE_HOURS = "hours"
+ARXIV_ANNOUNCEMENT_TZ = ZoneInfo("America/New_York")
+ARXIV_ANNOUNCEMENT_HOUR = 20
+ARXIV_ANNOUNCEMENT_WEEKDAYS = {0, 1, 2, 3, 6}
 
 
 def build_main_menu_markup() -> ReplyKeyboardMarkup:
@@ -100,6 +108,68 @@ def build_coffee_markup() -> Optional[InlineKeyboardMarkup]:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(text="Open support link", url=COFFEE_URL)]]
     )
+
+
+def build_recap_timezone_regions_markup() -> InlineKeyboardMarkup:
+    """Build the inline keyboard used to browse timezone groups."""
+    rows: List[List[InlineKeyboardButton]] = []
+    current_row: List[InlineKeyboardButton] = []
+    for group in RECAP_TIMEZONE_GROUPS:
+        current_row.append(
+            InlineKeyboardButton(
+                text=group,
+                callback_data=f"rtzpage:{group}:0",
+            )
+        )
+        if len(current_row) == 3:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+    return InlineKeyboardMarkup(rows)
+
+
+def build_recap_timezone_choices_markup(group: str, page: int = 0) -> InlineKeyboardMarkup:
+    """Build one paginated timezone selection keyboard for a given group."""
+    zones = get_recap_timezones_for_group(group)
+    if not zones:
+        return build_recap_timezone_regions_markup()
+
+    safe_page = max(0, page)
+    total_pages = max(1, math.ceil(len(zones) / RECAP_TIMEZONE_PAGE_SIZE))
+    safe_page = min(safe_page, total_pages - 1)
+    start = safe_page * RECAP_TIMEZONE_PAGE_SIZE
+    end = start + RECAP_TIMEZONE_PAGE_SIZE
+
+    rows: List[List[InlineKeyboardButton]] = []
+    for zone_name in zones[start:end]:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=zone_name,
+                    callback_data=f"rtzpick:{RECAP_TIMEZONE_INDEX[zone_name]}",
+                )
+            ]
+        )
+
+    navigation: List[InlineKeyboardButton] = []
+    if safe_page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="Prev",
+                callback_data=f"rtzpage:{group}:{safe_page - 1}",
+            )
+        )
+    navigation.append(InlineKeyboardButton(text="Regions", callback_data="rtzregions"))
+    if safe_page + 1 < total_pages:
+        navigation.append(
+            InlineKeyboardButton(
+                text="Next",
+                callback_data=f"rtzpage:{group}:{safe_page + 1}",
+            )
+        )
+    rows.append(navigation)
+    return InlineKeyboardMarkup(rows)
 
 
 @dataclass
@@ -137,6 +207,68 @@ def save_settings(data: dict[str, Any]) -> None:
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _list_available_recap_timezones() -> List[str]:
+    """Return the canonical timezone names offered for recap scheduling."""
+    try:
+        raw_timezones = available_timezones()
+    except Exception:
+        logger.exception("Could not load available time zones; falling back to UTC only.")
+        return [DEFAULT_DAILY_RECAP_TIMEZONE]
+
+    filtered: set[str] = {DEFAULT_DAILY_RECAP_TIMEZONE}
+    for zone_name in raw_timezones:
+        candidate = str(zone_name or "").strip()
+        if not candidate:
+            continue
+        if candidate in {"localtime", "build/etc/localtime"}:
+            continue
+        if candidate.startswith(("posix/", "right/", "build/")):
+            continue
+        filtered.add(candidate)
+
+    return sorted(
+        filtered,
+        key=lambda zone_name: (0 if zone_name == DEFAULT_DAILY_RECAP_TIMEZONE else 1, zone_name.casefold()),
+    )
+
+
+def _recap_timezone_group(zone_name: str) -> str:
+    """Map one timezone name to its browse group."""
+    if zone_name == DEFAULT_DAILY_RECAP_TIMEZONE:
+        return DEFAULT_DAILY_RECAP_TIMEZONE
+    if "/" in zone_name:
+        return zone_name.split("/", 1)[0]
+    return "Other"
+
+
+AVAILABLE_RECAP_TIMEZONES = _list_available_recap_timezones()
+RECAP_TIMEZONE_NAME_MAP = {zone_name.casefold(): zone_name for zone_name in AVAILABLE_RECAP_TIMEZONES}
+RECAP_TIMEZONE_INDEX = {zone_name: idx for idx, zone_name in enumerate(AVAILABLE_RECAP_TIMEZONES)}
+RECAP_TIMEZONE_GROUPS = sorted(
+    {_recap_timezone_group(zone_name) for zone_name in AVAILABLE_RECAP_TIMEZONES},
+    key=lambda group: (
+        0 if group == DEFAULT_DAILY_RECAP_TIMEZONE else 2 if group == "Other" else 1,
+        group.casefold(),
+    ),
+)
+
+
+def resolve_recap_timezone_name(raw: str) -> Optional[str]:
+    """Resolve a user-supplied timezone name to a canonical available timezone."""
+    cleaned = normalize_text(raw).replace(" ", "_")
+    if not cleaned:
+        return None
+    return RECAP_TIMEZONE_NAME_MAP.get(cleaned.casefold())
+
+
+def get_recap_timezones_for_group(group: str) -> List[str]:
+    """Return all available timezone names for one browse group."""
+    group_name = normalize_text(group)
+    if not group_name:
+        return []
+    return [zone_name for zone_name in AVAILABLE_RECAP_TIMEZONES if _recap_timezone_group(zone_name) == group_name]
 
 
 def _get_user_settings(settings: dict[str, Any], user_id: int) -> dict[str, Any]:
@@ -446,12 +578,33 @@ def _coerce_daily_recap_times(value: Any) -> List[str]:
             parsed.append(candidate)
         return parsed
 
-    return []
+    return [] 
 
 
-def daily_recap_time_to_time(time_str: str) -> time:
+def _coerce_daily_recap_timezone(value: Any) -> str:
+    if isinstance(value, str):
+        resolved = resolve_recap_timezone_name(value)
+        if resolved is not None:
+            return resolved
+    return DEFAULT_DAILY_RECAP_TIMEZONE
+
+
+def daily_recap_time_to_time(time_str: str, tz_name: str = DEFAULT_DAILY_RECAP_TIMEZONE) -> time:
+    """Convert one recap time string to a timezone-aware `datetime.time`."""
     hour_text, minute_text = time_str.split(":", 1)
-    return time(hour=int(hour_text), minute=int(minute_text), tzinfo=timezone.utc)
+    try:
+        tzinfo = ZoneInfo(_coerce_daily_recap_timezone(tz_name))
+    except Exception:
+        logger.exception("Could not load timezone %r for recap scheduling; falling back to UTC.", tz_name)
+        tzinfo = timezone.utc
+    return time(hour=int(hour_text), minute=int(minute_text), tzinfo=tzinfo)
+
+
+def get_daily_recap_timezone(user_id: int) -> str:
+    """Return the configured local timezone used for one user's recap schedule."""
+    settings = load_settings()
+    user_settings = _get_user_settings(settings, user_id)
+    return _coerce_daily_recap_timezone(user_settings.get("daily_recap_timezone"))
 
 
 def get_daily_recap_config(user_id: int) -> tuple[bool, List[str], Optional[int]]:
@@ -511,6 +664,7 @@ def remove_daily_recap_job(application: Application, user_id: int) -> None:
 async def daily_recap_fallback_loop(application: Application, user_id: int) -> None:
     while True:
         enabled, recap_times, chat_id = get_daily_recap_config(user_id)
+        recap_timezone = get_daily_recap_timezone(user_id)
         if not enabled:
             return
         if chat_id is None:
@@ -520,15 +674,17 @@ async def daily_recap_fallback_loop(application: Application, user_id: int) -> N
         now = datetime.now(timezone.utc)
         candidates: List[tuple[datetime, str]] = []
         for recap_time in recap_times:
-            target_time = daily_recap_time_to_time(recap_time)
-            run_at = now.replace(
+            target_time = daily_recap_time_to_time(recap_time, recap_timezone)
+            local_now = now.astimezone(target_time.tzinfo or timezone.utc)
+            run_at_local = local_now.replace(
                 hour=target_time.hour,
                 minute=target_time.minute,
                 second=0,
                 microsecond=0,
             )
-            if run_at <= now:
-                run_at += timedelta(days=1)
+            if run_at_local <= local_now:
+                run_at_local += timedelta(days=1)
+            run_at = run_at_local.astimezone(timezone.utc)
             candidates.append((run_at, recap_time))
 
         if not candidates:
@@ -560,6 +716,7 @@ def schedule_daily_recap_job(
     user_id: int,
     chat_id: int,
     recap_times: Sequence[str],
+    recap_timezone: str,
 ) -> None:
     remove_daily_recap_job(application, user_id)
     valid_times: List[str] = []
@@ -578,15 +735,16 @@ def schedule_daily_recap_job(
         for recap_time in valid_times:
             job_queue.run_daily(
                 callback=daily_recap_job_callback,
-                time=daily_recap_time_to_time(recap_time),
+                time=daily_recap_time_to_time(recap_time, recap_timezone),
                 name=daily_recap_job_name(user_id),
                 user_id=user_id,
                 chat_id=chat_id,
             )
         logger.info(
-            "Scheduled daily recap (JobQueue) for user %s at %s UTC (chat_id=%s)",
+            "Scheduled daily recap (JobQueue) for user %s at %s %s (chat_id=%s)",
             user_id,
             ",".join(valid_times),
+            recap_timezone,
             chat_id,
         )
         return
@@ -605,9 +763,10 @@ def schedule_daily_recap_job(
 
     task.add_done_callback(_cleanup)
     logger.info(
-        "Scheduled daily recap (fallback loop) for user %s at %s UTC (chat_id=%s)",
+        "Scheduled daily recap (fallback loop) for user %s at %s %s (chat_id=%s)",
         user_id,
         ",".join(valid_times),
+        recap_timezone,
         chat_id,
     )
 
@@ -637,7 +796,13 @@ def restore_daily_recap_jobs(application: Application) -> None:
             continue
 
         try:
-            schedule_daily_recap_job(application, user_id, chat_id, recap_times)
+            schedule_daily_recap_job(
+                application,
+                user_id,
+                chat_id,
+                recap_times,
+                get_daily_recap_timezone(user_id),
+            )
         except Exception:
             logger.exception("Could not schedule daily recap for user %s", user_id)
 
@@ -655,7 +820,7 @@ def parse_keywords_input(raw: str) -> List[str]:
     else:
         # Keep backward-compatible comma-separated lists, but when commas are
         # missing default to a single keyword so multi-word phrases work.
-        if '"' in raw or "'" in raw:
+        if ("\"" in raw or "'" in raw) and "+" not in raw:
             try:
                 items = shlex.split(raw)
             except Exception:
@@ -701,15 +866,121 @@ def ensure_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _normalize_search_scope(scope: Any) -> str:
+    token = normalize_text(str(scope or "")).casefold()
+    if token == SEARCH_SCOPE_TODAY:
+        return SEARCH_SCOPE_TODAY
+    return SEARCH_SCOPE_HOURS
+
+
+def _describe_search_window(scope: str, hours_back: int) -> str:
+    if _normalize_search_scope(scope) == SEARCH_SCOPE_TODAY:
+        return "the latest arXiv announcement batch and the last 24 hours on PubMed"
+    return f"the last {int(hours_back)} hours"
+
+
+def _latest_arxiv_announcement_time(now_utc: Optional[datetime] = None) -> datetime:
+    """Return the latest scheduled arXiv announcement time in UTC.
+
+    Parameters
+    ----------
+    now_utc : datetime, optional
+        Reference timestamp in UTC. If omitted, the current UTC time is used.
+
+    Returns
+    -------
+    datetime
+        UTC timestamp for the latest scheduled arXiv announcement batch.
+
+    Notes
+    -----
+    arXiv publishes announcement batches at 20:00 Eastern US on Sunday
+    through Thursday. Friday and Saturday have no scheduled announcements.
+    This follows arXiv's regular published schedule and does not model ad hoc
+    holiday deferrals.
+
+    Examples
+    --------
+    >>> isinstance(_latest_arxiv_announcement_time(), datetime)
+    True
+    """
+    reference_utc = ensure_utc(now_utc or datetime.now(timezone.utc))
+    reference_et = reference_utc.astimezone(ARXIV_ANNOUNCEMENT_TZ)
+
+    candidate_date = reference_et.date()
+    candidate_time = datetime.combine(
+        candidate_date,
+        time(hour=ARXIV_ANNOUNCEMENT_HOUR),
+        tzinfo=ARXIV_ANNOUNCEMENT_TZ,
+    )
+    if reference_et < candidate_time:
+        candidate_date -= timedelta(days=1)
+
+    while candidate_date.weekday() not in ARXIV_ANNOUNCEMENT_WEEKDAYS:
+        candidate_date -= timedelta(days=1)
+
+    return datetime.combine(
+        candidate_date,
+        time(hour=ARXIV_ANNOUNCEMENT_HOUR),
+        tzinfo=ARXIV_ANNOUNCEMENT_TZ,
+    ).astimezone(timezone.utc)
+
+
+def _entries_to_latest_arxiv_batch_papers(
+    entries: Sequence[Any],
+    now_utc: Optional[datetime] = None,
+) -> List[Paper]:
+    """Convert arXiv API entries to papers from the latest announcement batch.
+
+    Parameters
+    ----------
+    entries : Sequence[Any]
+        Parsed arXiv API entries for a keyword query.
+    now_utc : datetime, optional
+        Reference timestamp in UTC. If omitted, the current UTC time is used.
+
+    Returns
+    -------
+    List[Paper]
+        Papers whose published timestamp falls in the most recent scheduled
+        arXiv announcement batch.
+
+    Notes
+    -----
+    The Today view should mirror arXiv's batch announcements rather than a
+    rolling 24-hour window, because arXiv does not publish continuously.
+
+    Examples
+    --------
+    >>> _entries_to_latest_arxiv_batch_papers([])
+    []
+    """
+    latest_batch_utc = _latest_arxiv_announcement_time(now_utc)
+    papers: List[Paper] = []
+
+    for entry in entries:
+        paper = entry_to_paper(entry, index=len(papers) + 1)
+        if paper is None:
+            continue
+        if paper.published >= latest_batch_utc:
+            papers.append(paper)
+
+    return papers
+
+
 def build_arxiv_query(keywords: Sequence[str]) -> Optional[str]:
+    def build_term_clause(term: str) -> Optional[str]:
+        term_clean = term.replace('"', "").strip()
+        if not term_clean:
+            return None
+        return f'(ti:"{term_clean}" OR abs:"{term_clean}" OR all:"{term_clean}")'
+
     keyword_groups: List[str] = []
     for kw in keywords:
-        kw_clean = kw.replace('"', "").strip()
-        if not kw_clean:
+        term_clauses = [clause for clause in (build_term_clause(part) for part in kw.split("+")) if clause]
+        if not term_clauses:
             continue
-        keyword_groups.append(
-            f'(ti:"{kw_clean}" OR abs:"{kw_clean}" OR all:"{kw_clean}")'
-        )
+        keyword_groups.append("(" + " AND ".join(term_clauses) + ")")
 
     if not keyword_groups:
         return None
@@ -718,14 +989,18 @@ def build_arxiv_query(keywords: Sequence[str]) -> Optional[str]:
 
 
 def build_pubmed_query(keywords: Sequence[str]) -> Optional[str]:
+    def build_term_clause(term: str) -> Optional[str]:
+        term_clean = term.replace('"', "").strip()
+        if not term_clean:
+            return None
+        return f'("{term_clean}"[Title/Abstract] OR "{term_clean}"[MeSH Terms])'
+
     clauses: List[str] = []
     for kw in keywords:
-        kw_clean = kw.replace('"', "").strip()
-        if not kw_clean:
+        term_clauses = [clause for clause in (build_term_clause(part) for part in kw.split("+")) if clause]
+        if not term_clauses:
             continue
-        clauses.append(
-            f'("{kw_clean}"[Title/Abstract] OR "{kw_clean}"[MeSH Terms])'
-        )
+        clauses.append("(" + " AND ".join(term_clauses) + ")")
 
     if not clauses:
         return None
@@ -1414,7 +1689,7 @@ def find_cached_paper_by_ref(
     refreshed between `/today` and the button press.
     """
     source_norm = str(source or "").casefold()
-    for paper in get_cached_papers(context):
+    for paper in list(context.user_data.get("papers", [])):
         if paper.source.casefold() == source_norm and paper.arxiv_id == paper_id:
             return paper
     return None
@@ -1493,13 +1768,18 @@ async def refresh_cache(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     hours_back: Optional[int] = None,
+    scope: Optional[str] = None,
 ) -> List[Paper]:
     user_id = _get_user_id(update)
     if user_id is None:
         raise RuntimeError("Could not determine the Telegram user for this request.")
 
     user_data = context.user_data
-    effective_hours_back = int(hours_back) if hours_back is not None else TODAY_HOURS_BACK
+    cached_hours_back = int(user_data.get("cache_hours_back", TODAY_HOURS_BACK))
+    effective_scope = _normalize_search_scope(
+        scope if scope is not None else user_data.get("cache_scope", SEARCH_SCOPE_TODAY)
+    )
+    effective_hours_back = int(hours_back) if hours_back is not None else cached_hours_back
     keywords_by_source = get_keywords_by_source(user_data=user_data, user_id=user_id)
     arxiv_keywords = keywords_by_source[SOURCE_ARXIV]
     pubmed_keywords = keywords_by_source[SOURCE_PUBMED]
@@ -1514,6 +1794,7 @@ async def refresh_cache(
         user_data["last_raw_entry_count"] = 0
         user_data["last_raw_entry_breakdown"] = {}
         user_data["cache_hours_back"] = effective_hours_back
+        user_data["cache_scope"] = effective_scope
         logger.info("No active query; waiting for keywords")
         return []
 
@@ -1534,7 +1815,12 @@ async def refresh_cache(
             DEFAULT_MAX_RESULTS,
         )
         arxiv_raw_count = len(entries)
-        arxiv_papers = entries_to_recent_papers(entries, effective_hours_back)
+        if effective_scope == SEARCH_SCOPE_TODAY:
+            # Today mirrors arXiv's scheduled announcement batches, not a
+            # rolling 24-hour window.
+            arxiv_papers = _entries_to_latest_arxiv_batch_papers(entries)
+        else:
+            arxiv_papers = entries_to_recent_papers(entries, effective_hours_back)
 
     pubmed_papers: List[Paper] = []
     pubmed_request_url = ""
@@ -1577,6 +1863,7 @@ async def refresh_cache(
     user_data["last_raw_entry_count"] = raw_total
     user_data["last_raw_entry_breakdown"] = raw_breakdown
     user_data["cache_hours_back"] = effective_hours_back
+    user_data["cache_scope"] = effective_scope
     return papers
 
 
@@ -1726,9 +2013,14 @@ async def daily_recap_job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
 def get_cached_papers(
     context: ContextTypes.DEFAULT_TYPE,
     hours_back: Optional[int] = None,
+    scope: Optional[str] = None,
 ) -> List[Paper]:
     expected_hours = int(hours_back) if hours_back is not None else TODAY_HOURS_BACK
     if context.user_data.get("cache_hours_back") != expected_hours:
+        return []
+    expected_scope = _normalize_search_scope(scope if scope is not None else SEARCH_SCOPE_TODAY)
+    cached_scope = _normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY))
+    if cached_scope != expected_scope:
         return []
     return list(context.user_data.get("papers", []))
 
@@ -1756,11 +2048,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "<b>Quick Start</b>\n"
             f"1. Add keywords with <b>{html.escape(MENU_BTN_ADD_ARXIV_KEYWORD)}</b> and "
             f"<b>{html.escape(MENU_BTN_ADD_PUBMED_KEYWORD)}</b>\n"
-            f"2. Tap <b>{html.escape(MENU_BTN_TODAY)}</b> for the last 24 hours\n"
+            f"2. Tap <b>{html.escape(MENU_BTN_TODAY)}</b> for the latest arXiv batch and the last 24 hours on PubMed\n"
             f"3. Tap <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a custom time window\n"
             f"4. Use <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b> and "
-            f"<b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b> for automatic updates at one or more UTC times\n\n"
-            "<b>Tip</b>: keyword phrases are supported, e.g. <code>\"quantum mechanics\"</code>."
+            f"<b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b> for automatic updates at one or more local times\n\n"
+            "<b>Tip</b>: use commas for OR and <code>+</code> inside one clause for AND, "
+            'e.g. <code>"quantum mechanics" + entanglement, superconductivity</code>.'
         )
         await update.message.reply_text(
             welcome_text,
@@ -1787,8 +2080,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def build_help_text() -> str:
     return (
         "<b>Menu Actions</b>\n"
-        f"• <b>{html.escape(MENU_BTN_TODAY)}</b>: show matching papers from the last 24 hours\n"
-        f"• <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b>: run a custom search window\n"
+        f"• <b>{html.escape(MENU_BTN_TODAY)}</b>: show the latest arXiv announcement batch plus the last 24 hours on PubMed\n"
+        f"• <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b>: run a custom rolling-hour search window for both sources\n"
         f"• <b>{html.escape(MENU_BTN_KEYWORDS)}</b>: show active arXiv and PubMed keyword lists\n"
         f"• <b>{html.escape(MENU_BTN_BOOKMARKS)}</b>: show saved papers\n\n"
         "<b>Keyword Management</b>\n"
@@ -1800,12 +2093,13 @@ def build_help_text() -> str:
         f"• <b>{html.escape(MENU_BTN_CLEAR_PUBMED_KEYWORD)}</b>: clear all PubMed keywords\n\n"
         "<b>Recap</b>\n"
         f"• <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b>: toggle daily recap\n"
-        f"• <b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>: set one or more recap times in UTC (HH:MM)\n"
+        f"• <b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>: choose a time zone and set one or more local recap times (HH:MM)\n"
         f"• <b>{html.escape(MENU_BTN_RECAP_STATUS)}</b>: show recap status and configured times\n\n"
         "<b>Other</b>\n"
         f"• <b>{html.escape(MENU_BTN_HELP)}</b>: show this guide\n"
         f"• <b>{html.escape(MENU_BTN_COFFEE)}</b>: open support link\n\n"
-        "<b>Tip</b>: phrase keywords are supported, e.g. <code>\"quantum mechanics\"</code>."
+        "<b>Tip</b>: use commas for OR and <code>+</code> inside one clause for AND, "
+        'e.g. <code>"quantum mechanics" + entanglement, superconductivity</code>.'
     )
 
 
@@ -1853,13 +2147,16 @@ async def keywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.message:
         await update.message.reply_text(
             "<b>Active Keywords</b>\n\n"
-            f"<b>Today window</b>: last {TODAY_HOURS_BACK} hours\n\n"
+            "<b>Today window</b>\n"
+            "arXiv: latest announcement batch\n"
+            f"PubMed: last {TODAY_HOURS_BACK} hours\n\n"
             "<b>arXiv</b>\n"
             f"<pre>{arxiv_body}</pre>\n\n"
             "<b>PubMed</b>\n"
             f"<pre>{pubmed_body}</pre>\n\n"
             f"Use <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a custom time window.\n"
-            "Tip: phrase keywords are supported, e.g. <code>\"quantum mechanics\"</code>.",
+            "Tip: use commas for OR and <code>+</code> inside one clause for AND, "
+            'e.g. <code>"quantum mechanics" + entanglement, superconductivity</code>.',
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
         )
@@ -1871,7 +2168,9 @@ def _clear_pending_input_flags(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_remove_keyword_source", None)
     context.user_data.pop("awaiting_search_hours_input", None)
     context.user_data.pop("awaiting_hours_input", None)
+    context.user_data.pop("awaiting_recap_timezone_input", None)
     context.user_data.pop("awaiting_recap_time_input", None)
+    context.user_data.pop("pending_recap_timezone", None)
 
 
 async def prompt_setkeywords_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1882,7 +2181,8 @@ async def prompt_setkeywords_input(update: Update, context: ContextTypes.DEFAULT
             "<b>Set Keywords (Both Sources)</b>\n\n"
             "Send keywords as comma-separated values.\n\n"
             "<b>Example</b>\n"
-            "<code>astronomy, climate change, photosynthesis</code>\n\n"
+            "<code>astronomy, climate change + photosynthesis</code>\n\n"
+            "Use <code>+</code> inside one clause to require all terms.\n\n"
             "To edit one source only, use the dedicated Add, Remove and Clear buttons.",
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
@@ -1904,8 +2204,8 @@ async def prompt_add_keyword_for_source(
             "Use commas to separate multiple values.\n\n"
             "<b>Examples</b>\n"
             "<code>quantum mechanics</code>\n"
-            "<code>astronomy, climate change, photosynthesis</code>\n"
-            "<code>\"quantum mechanics\" astronomy</code>",
+            "<code>astronomy, climate change + photosynthesis</code>\n"
+            "<code>\"quantum mechanics\" + entanglement</code>",
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
         )
@@ -1976,10 +2276,15 @@ async def prompt_searchhours_input(update: Update, context: ContextTypes.DEFAULT
         )
 
 
-def build_open_results_markup(hours_back: int) -> InlineKeyboardMarkup:
+def build_open_results_markup(
+    hours_back: int,
+    scope: str = SEARCH_SCOPE_HOURS,
+) -> InlineKeyboardMarkup:
     safe_hours = max(1, int(hours_back))
+    safe_scope = _normalize_search_scope(scope)
+    button_text = "Open Today results" if safe_scope == SEARCH_SCOPE_TODAY else f"Open results ({safe_hours}h)"
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(text=f"Open results ({safe_hours}h)", callback_data=f"open_matches:{safe_hours}")]]
+        [[InlineKeyboardButton(text=button_text, callback_data=f"open_matches:{safe_scope}:{safe_hours}")]]
     )
 
 
@@ -1988,16 +2293,17 @@ async def send_open_results_prompt(
     context: ContextTypes.DEFAULT_TYPE,
     papers_count: int,
     hours_back: int,
+    scope: str = SEARCH_SCOPE_HOURS,
 ) -> None:
     chat = update.effective_chat
+    scope_text = html.escape(_describe_search_window(scope, hours_back))
     if update.message is not None:
         await update.message.reply_text(
             (
-                f"<b>Found {papers_count} matching paper(s)</b> in the last "
-                f"<b>{hours_back} hours</b>.\n"
+                f"<b>Found {papers_count} matching paper(s)</b> in {scope_text}.\n"
                 "Tap the button below to open results now."
             ),
-            reply_markup=build_open_results_markup(hours_back),
+            reply_markup=build_open_results_markup(hours_back, scope=scope),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2005,11 +2311,10 @@ async def send_open_results_prompt(
         await context.bot.send_message(
             chat_id=chat.id,
             text=(
-                f"<b>Found {papers_count} matching paper(s)</b> in the last "
-                f"<b>{hours_back} hours</b>.\n"
+                f"<b>Found {papers_count} matching paper(s)</b> in {scope_text}.\n"
                 "Tap the button below to open results now."
             ),
-            reply_markup=build_open_results_markup(hours_back),
+            reply_markup=build_open_results_markup(hours_back, scope=scope),
             parse_mode=ParseMode.HTML,
         )
 
@@ -2067,6 +2372,7 @@ async def apply_keywords_input(
         context=context,
         papers_count=len(papers),
         hours_back=int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK)),
+        scope=_normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY)),
     )
     return True
 
@@ -2240,6 +2546,7 @@ async def apply_keywords_input_for_source(
         context=context,
         papers_count=len(papers),
         hours_back=int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK)),
+        scope=_normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY)),
     )
     return True
 
@@ -2293,6 +2600,7 @@ async def apply_set_keywords_for_source(
         context=context,
         papers_count=len(papers),
         hours_back=int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK)),
+        scope=_normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY)),
     )
     return True
 
@@ -2312,6 +2620,7 @@ async def apply_search_hours_input(
         context=context,
         hours_back=hours,
         force_refresh=True,
+        scope=SEARCH_SCOPE_HOURS,
     )
 
 
@@ -2327,8 +2636,9 @@ async def setkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if update.message:
                 await update.message.reply_text(
                     "Format:\n"
-                    "arxiv kw1, kw2\n"
-                    "pubmed kw1, kw2\n\n"
+                    "arxiv kw1, kw2 + kw3\n"
+                    "pubmed kw1, kw2 + kw3\n\n"
+                    "Use commas for OR and + for AND inside one clause.\n\n"
                     f"You can also use {MENU_BTN_ADD_ARXIV_KEYWORD} or {MENU_BTN_ADD_PUBMED_KEYWORD}.",
                     reply_markup=build_main_menu_markup(),
                 )
@@ -2419,8 +2729,9 @@ async def addkeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text(
                 "Format:\n"
                 "arxiv quantum mechanics\n"
-                "arxiv astronomy, climate change, photosynthesis\n"
+                "arxiv astronomy, climate change + photosynthesis\n"
                 "pubmed genetics\n\n"
+                "Use commas for OR and + for AND inside one clause.\n\n"
                 f"Or use {MENU_BTN_ADD_ARXIV_KEYWORD} / {MENU_BTN_ADD_PUBMED_KEYWORD}.",
                 reply_markup=build_main_menu_markup(),
             )
@@ -2449,8 +2760,9 @@ async def removekeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text(
                 "Format:\n"
                 "arxiv quantum mechanics\n"
-                "arxiv astronomy, photosynthesis\n"
+                "arxiv astronomy, climate change + photosynthesis\n"
                 "pubmed genetics\n\n"
+                "Use the exact saved clause when removing keywords.\n\n"
                 f"Or use {MENU_BTN_REMOVE_ARXIV_KEYWORD} / {MENU_BTN_REMOVE_PUBMED_KEYWORD}.",
                 reply_markup=build_main_menu_markup(),
             )
@@ -2494,6 +2806,160 @@ async def sethours_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await searchhours_cmd(update, context)
 
 
+def format_recap_timezone_clock(tz_name: str) -> str:
+    """Format the current clock time for one recap timezone."""
+    try:
+        local_now = datetime.now(timezone.utc).astimezone(ZoneInfo(_coerce_daily_recap_timezone(tz_name)))
+    except Exception:
+        logger.exception("Could not format local recap time for timezone %r.", tz_name)
+        local_now = datetime.now(timezone.utc)
+    return local_now.strftime("%Y-%m-%d %H:%M %Z")
+
+
+async def show_recap_timezone_picker(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    group: Optional[str] = None,
+    page: int = 0,
+) -> None:
+    user_id = _get_user_id(update)
+    current_timezone = get_daily_recap_timezone(user_id) if user_id is not None else DEFAULT_DAILY_RECAP_TIMEZONE
+    current_local_time = format_recap_timezone_clock(current_timezone)
+
+    if group:
+        zones = get_recap_timezones_for_group(group)
+        total_pages = max(1, math.ceil(len(zones) / RECAP_TIMEZONE_PAGE_SIZE)) if zones else 1
+        safe_page = min(max(0, page), total_pages - 1)
+        text = (
+            "<b>Set Recap Time</b>\n\n"
+            "Choose a time zone for your local recap schedule.\n\n"
+            f"<b>Current time zone</b>: <code>{html.escape(current_timezone)}</code>\n"
+            f"<b>Current local time</b>: {html.escape(current_local_time)}\n"
+            f"<b>Browsing</b>: {html.escape(group)} ({safe_page + 1}/{total_pages})\n\n"
+            "Tap a time zone below or send an exact zone name such as "
+            "<code>Europe/Rome</code>."
+        )
+        reply_markup = build_recap_timezone_choices_markup(group, safe_page)
+    else:
+        text = (
+            "<b>Set Recap Time</b>\n\n"
+            "1. Choose your time zone.\n"
+            "2. Then send one or more local recap times as HH:MM.\n\n"
+            f"<b>Current time zone</b>: <code>{html.escape(current_timezone)}</code>\n"
+            f"<b>Current local time</b>: {html.escape(current_local_time)}\n\n"
+            "Browse all available time zones by region below, or send an exact "
+            "zone name such as <code>Europe/Rome</code>."
+        )
+        reply_markup = build_recap_timezone_regions_markup()
+
+    query = update.callback_query
+    chat = update.effective_chat
+    if query is not None and query.message is not None:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if update.message is not None:
+        await update.message.reply_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if chat is not None:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+        )
+
+
+def _set_pending_recap_timezone(context: ContextTypes.DEFAULT_TYPE, tz_name: str) -> str:
+    resolved = _coerce_daily_recap_timezone(tz_name)
+    context.user_data["pending_recap_timezone"] = resolved
+    context.user_data.pop("awaiting_recap_timezone_input", None)
+    context.user_data["awaiting_recap_time_input"] = True
+    return resolved
+
+
+async def prompt_recap_local_time_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    tz_name: str,
+) -> None:
+    resolved_timezone = _set_pending_recap_timezone(context, tz_name)
+    local_now_label = format_recap_timezone_clock(resolved_timezone)
+    text = (
+        "<b>Set Recap Time</b>\n\n"
+        f"<b>Time zone</b>: <code>{html.escape(resolved_timezone)}</code>\n"
+        f"<b>Current local time</b>: {html.escape(local_now_label)}\n\n"
+        "Send one or more local recap times as HH:MM.\n"
+        "Use commas or spaces to separate multiple times.\n\n"
+        "<b>Examples</b>\n"
+        "<code>09:30</code>\n"
+        "<code>09:30, 21:00</code>"
+    )
+
+    query = update.callback_query
+    chat = update.effective_chat
+    if query is not None and query.message is not None:
+        await query.edit_message_text(
+            text=text,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if update.message is not None:
+        await update.message.reply_text(
+            text,
+            reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if chat is not None:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def apply_recap_timezone_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw: str,
+) -> bool:
+    cleaned = normalize_text(raw)
+    if not cleaned:
+        if update.message:
+            await update.message.reply_text(
+                "Please choose a time zone from the list or send an exact name such as Europe/Rome.",
+                reply_markup=build_main_menu_markup(),
+            )
+        return False
+
+    parts = cleaned.split(maxsplit=1)
+    tz_name = resolve_recap_timezone_name(parts[0])
+    if tz_name is None:
+        if update.message:
+            await update.message.reply_text(
+                "Invalid time zone.\n"
+                "Send an exact available name such as Europe/Rome, US/Eastern, or UTC.",
+                reply_markup=build_main_menu_markup(),
+            )
+        return False
+
+    if len(parts) > 1 and parts[1].strip():
+        _set_pending_recap_timezone(context, tz_name)
+        return await apply_recap_time_input(update, context, parts[1].strip())
+
+    await prompt_recap_local_time_input(update, context, tz_name)
+    return True
+
+
 async def dailyrecap_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = _get_user_id(update)
     if user_id is None:
@@ -2502,6 +2968,7 @@ async def dailyrecap_status_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     enabled, recap_times, chat_id = get_daily_recap_config(user_id)
+    recap_timezone = get_daily_recap_timezone(user_id)
     status = "enabled" if enabled else "disabled"
     chat_label = str(chat_id) if chat_id is not None else "(not set)"
     times_label = ", ".join(recap_times)
@@ -2510,7 +2977,9 @@ async def dailyrecap_status_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(
             "Daily recap status:\n"
             f"- Status: {status}\n"
-            f"- Times (UTC): {times_label}\n"
+            f"- Time zone: {recap_timezone}\n"
+            f"- Times (local): {times_label}\n"
+            f"- Current local time: {format_recap_timezone_clock(recap_timezone)}\n"
             f"- Chat ID: {chat_label}\n\n"
             f"Use {MENU_BTN_DAILY_RECAP} and {MENU_BTN_SET_RECAP_TIME}.",
             reply_markup=build_main_menu_markup(),
@@ -2519,18 +2988,8 @@ async def dailyrecap_status_cmd(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def prompt_setrecaptime_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _clear_pending_input_flags(context)
-    context.user_data["awaiting_recap_time_input"] = True
-    if update.message:
-        await update.message.reply_text(
-            "<b>Set Recap Time</b>\n\n"
-            "Send one or more recap times in UTC as HH:MM.\n"
-            "Use commas or spaces to separate multiple times.\n\n"
-            "<b>Examples</b>\n"
-            "<code>09:30</code>\n"
-            "<code>09:30, 21:00</code>",
-            reply_markup=build_main_menu_markup(),
-            parse_mode=ParseMode.HTML,
-        )
+    context.user_data["awaiting_recap_timezone_input"] = True
+    await show_recap_timezone_picker(update, context)
 
 
 async def apply_recap_time_input(
@@ -2545,12 +3004,15 @@ async def apply_recap_time_input(
             await update.message.reply_text("Could not determine user/chat for recap settings.")
         return False
 
+    recap_timezone = _coerce_daily_recap_timezone(
+        context.user_data.get("pending_recap_timezone") or get_daily_recap_timezone(user_id)
+    )
     recap_times = parse_daily_recap_times(raw)
     if recap_times is None:
         if update.message:
             await update.message.reply_text(
                 "Invalid time format.\n"
-                "Use one or more HH:MM times in UTC.\n"
+                f"Use one or more HH:MM times in {recap_timezone}.\n"
                 "Examples: 09:30 or 09:30, 21:00."
             )
         return False
@@ -2558,13 +3020,14 @@ async def apply_recap_time_input(
         if update.message:
             await update.message.reply_text(
                 "Please provide at least one time.\n"
-                "Example: 09:30 or 09:30, 21:00."
+                f"Example in {recap_timezone}: 09:30 or 09:30, 21:00."
             )
         return False
 
     _save_user_setting(user_id, "daily_recap_times", recap_times)
     # Keep legacy single-time key for backward compatibility.
     _save_user_setting(user_id, "daily_recap_time", recap_times[0])
+    _save_user_setting(user_id, "daily_recap_timezone", recap_timezone)
     _save_user_setting(user_id, "daily_recap_chat_id", int(chat.id))
 
     enabled, _, _ = get_daily_recap_config(user_id)
@@ -2575,6 +3038,7 @@ async def apply_recap_time_input(
                 user_id=user_id,
                 chat_id=int(chat.id),
                 recap_times=recap_times,
+                recap_timezone=recap_timezone,
             )
         except Exception as exc:
             logger.exception("Could not reschedule daily recap after time update")
@@ -2585,10 +3049,13 @@ async def apply_recap_time_input(
     if update.message:
         times_label = ", ".join(recap_times)
         await update.message.reply_text(
-            f"Daily recap times set to {times_label} UTC."
+            f"Daily recap times set to {times_label} in {recap_timezone}."
             + (" Recap is active." if enabled else " Recap is currently OFF."),
             reply_markup=build_main_menu_markup(),
         )
+    context.user_data.pop("awaiting_recap_time_input", None)
+    context.user_data.pop("awaiting_recap_timezone_input", None)
+    context.user_data.pop("pending_recap_timezone", None)
     return True
 
 
@@ -2598,6 +3065,15 @@ async def setrecaptime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     _clear_pending_input_flags(context)
+    maybe_timezone = resolve_recap_timezone_name(context.args[0])
+    if maybe_timezone is not None:
+        if len(context.args) == 1:
+            await prompt_recap_local_time_input(update, context, maybe_timezone)
+            return
+        _set_pending_recap_timezone(context, maybe_timezone)
+        await apply_recap_time_input(update, context, " ".join(context.args[1:]).strip())
+        return
+
     raw = " ".join(context.args).strip()
     await apply_recap_time_input(update, context, raw)
 
@@ -2615,9 +3091,11 @@ async def set_daily_recap_enabled(
         return False
 
     _, recap_times, _ = get_daily_recap_config(user_id)
+    recap_timezone = get_daily_recap_timezone(user_id)
     _save_user_setting(user_id, "daily_recap_enabled", bool(enabled))
     _save_user_setting(user_id, "daily_recap_times", recap_times)
     _save_user_setting(user_id, "daily_recap_time", recap_times[0])
+    _save_user_setting(user_id, "daily_recap_timezone", recap_timezone)
     _save_user_setting(user_id, "daily_recap_chat_id", int(chat.id))
 
     if enabled:
@@ -2627,6 +3105,7 @@ async def set_daily_recap_enabled(
                 user_id=user_id,
                 chat_id=int(chat.id),
                 recap_times=recap_times,
+                recap_timezone=recap_timezone,
             )
         except Exception as exc:
             logger.exception("Could not enable daily recap")
@@ -2635,7 +3114,7 @@ async def set_daily_recap_enabled(
             return False
         times_label = ", ".join(recap_times)
         message = (
-            f"Daily recap enabled. You will receive updates every day at {times_label} UTC.\n"
+            f"Daily recap enabled. You will receive updates every day at {times_label} in {recap_timezone}.\n"
             f"Each recap includes papers from the last {DAILY_RECAP_HOURS} hours."
         )
     else:
@@ -2680,6 +3159,43 @@ async def dailyrecap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+async def recap_timezone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    data = query.data or ""
+    if data == "rtzregions":
+        await query.answer()
+        await show_recap_timezone_picker(update, context)
+        return
+
+    if data.startswith("rtzpage:"):
+        payload = data.removeprefix("rtzpage:")
+        try:
+            group, page_text = payload.rsplit(":", 1)
+            page = int(page_text)
+        except ValueError:
+            await query.answer("Invalid time zone page.", show_alert=True)
+            return
+        await query.answer()
+        await show_recap_timezone_picker(update, context, group=group, page=page)
+        return
+
+    if data.startswith("rtzpick:"):
+        raw_index = data.removeprefix("rtzpick:").strip()
+        try:
+            zone_name = AVAILABLE_RECAP_TIMEZONES[int(raw_index)]
+        except (ValueError, IndexError):
+            await query.answer("Invalid time zone.", show_alert=True)
+            return
+        await query.answer(f"Selected {zone_name}")
+        await prompt_recap_local_time_input(update, context, zone_name)
+        return
+
+    await query.answer()
+
+
 async def open_matches_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -2691,6 +3207,10 @@ async def open_matches_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     raw_hours = data.removeprefix("open_matches:").strip()
+    raw_scope = SEARCH_SCOPE_HOURS
+    if ":" in raw_hours:
+        raw_scope, raw_hours = raw_hours.split(":", 1)
+    scope = _normalize_search_scope(raw_scope)
     try:
         hours_back = int(raw_hours)
     except ValueError:
@@ -2707,6 +3227,7 @@ async def open_matches_callback(update: Update, context: ContextTypes.DEFAULT_TY
         context=context,
         hours_back=hours_back,
         force_refresh=True,
+        scope=scope,
     )
 
 
@@ -2743,6 +3264,7 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "awaiting_remove_keyword_source",
         "awaiting_search_hours_input",
         "awaiting_hours_input",
+        "awaiting_recap_timezone_input",
         "awaiting_recap_time_input",
     ]
     has_pending_action = any(context.user_data.get(flag, False) for flag in pending_flags)
@@ -2796,9 +3318,12 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data.pop("awaiting_hours_input", None)
         return
 
+    if context.user_data.get("awaiting_recap_timezone_input", False):
+        await apply_recap_timezone_input(update, context, text)
+        return
+
     if context.user_data.get("awaiting_recap_time_input", False):
         await apply_recap_time_input(update, context, text)
-        context.user_data.pop("awaiting_recap_time_input", None)
         return
 
     await message.reply_text(
@@ -2817,6 +3342,7 @@ async def debugquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     arxiv_keywords = keywords_by_source[SOURCE_ARXIV]
     pubmed_keywords = keywords_by_source[SOURCE_PUBMED]
     hours_back = int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK))
+    scope = _normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY))
 
     if not query:
         arxiv_query = build_arxiv_query(keywords=arxiv_keywords)
@@ -2835,6 +3361,7 @@ async def debugquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         pubmed_raw = int(raw_breakdown.get("pubmed", 0) or 0)
 
     msg = (
+        f"Search scope: {_describe_search_window(scope, hours_back)}\n"
         f"Hours back: {hours_back}\n"
         f"arXiv keywords: {arxiv_keywords if arxiv_keywords else '(none)'}\n"
         f"PubMed keywords: {pubmed_keywords if pubmed_keywords else '(none)'}\n\n"
@@ -2860,9 +3387,11 @@ async def run_search_for_hours(
     context: ContextTypes.DEFAULT_TYPE,
     hours_back: int,
     force_refresh: bool = False,
+    scope: str = SEARCH_SCOPE_HOURS,
 ) -> bool:
     user_id = _get_user_id(update)
     chat = update.effective_chat
+    effective_scope = _normalize_search_scope(scope)
 
     async def send_text(
         text: str,
@@ -2888,10 +3417,15 @@ async def run_search_for_hours(
                 disable_web_page_preview=disable_web_page_preview,
             )
 
-    papers = [] if force_refresh else get_cached_papers(context, hours_back=hours_back)
+    papers = [] if force_refresh else get_cached_papers(context, hours_back=hours_back, scope=effective_scope)
     if not papers:
         try:
-            papers = await refresh_cache(update, context, hours_back=hours_back)
+            papers = await refresh_cache(
+                update,
+                context,
+                hours_back=hours_back,
+                scope=effective_scope,
+            )
         except Exception as exc:
             logger.exception("Search refresh failed")
             await send_text(f"Could not fetch papers:\n{exc}")
@@ -2912,7 +3446,7 @@ async def run_search_for_hours(
             )
         else:
             text = (
-                f"No matching papers found in the last {hours_back} hours.\n"
+                f"No matching papers found in {_describe_search_window(effective_scope, hours_back)}.\n"
                 f"Raw entries fetched: {raw_count} "
                 f"(arXiv: {arxiv_raw}, PubMed: {pubmed_raw})\n\n"
                 f"Adjust keywords via {MENU_BTN_KEYWORDS} and try again."
@@ -2922,7 +3456,7 @@ async def run_search_for_hours(
         return True
 
     await send_text(
-        f"Found {len(papers)} matching paper(s) in the last {hours_back} hours.",
+        f"Found {len(papers)} matching paper(s) in {_describe_search_window(effective_scope, hours_back)}.",
         reply_markup=build_main_menu_markup(),
     )
 
@@ -2946,6 +3480,7 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context=context,
         hours_back=TODAY_HOURS_BACK,
         force_refresh=True,
+        scope=SEARCH_SCOPE_TODAY,
     )
 
 
@@ -3193,6 +3728,7 @@ def main() -> None:
     app.add_handler(CommandHandler("debugquery", debugquery_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_router))
+    app.add_handler(CallbackQueryHandler(recap_timezone_callback, pattern=r"^rtz"))
     app.add_handler(CallbackQueryHandler(open_matches_callback, pattern=r"^open_matches:"))
     app.add_handler(CallbackQueryHandler(pdf_callback, pattern=r"^pdf:"))
     app.add_handler(CallbackQueryHandler(bookmark_callback, pattern=r"^bm:"))
