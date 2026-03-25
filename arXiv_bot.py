@@ -1144,8 +1144,8 @@ def entries_to_recent_papers(entries: Sequence[Any], hours_back: int) -> List[Pa
         if paper is None:
             continue
 
-        if paper.published < cutoff:
-            break
+        if paper.updated < cutoff:
+            continue
 
         papers.append(paper)
 
