@@ -53,10 +53,10 @@ MENU_BTN_TODAY = "Today"
 MENU_BTN_KEYWORDS = "Keywords"
 MENU_BTN_ADD_ARXIV_KEYWORD = "➕ arXiv keywords"
 MENU_BTN_REMOVE_ARXIV_KEYWORD = "➖ arXiv keywords"
-MENU_BTN_CLEAR_ARXIV_KEYWORD = "Clear arXiv keywords"
+MENU_BTN_CLEAR_ARXIV_KEYWORD = "🧹 arXiv keywords"
 MENU_BTN_ADD_PUBMED_KEYWORD = "➕ PubMed keywords"
 MENU_BTN_REMOVE_PUBMED_KEYWORD = "➖ PubMed keywords"
-MENU_BTN_CLEAR_PUBMED_KEYWORD = "Clear PubMed keywords"
+MENU_BTN_CLEAR_PUBMED_KEYWORD = "🧹 PubMed keywords"
 MENU_BTN_SEARCH_HOURS = "Search Hours"
 MENU_BTN_DAILY_RECAP = "Recap On/Off"
 MENU_BTN_SET_RECAP_TIME = "Recap Time"
@@ -412,18 +412,61 @@ def parse_daily_recap_time(raw: str) -> Optional[str]:
     return f"{hour:02d}:{minute:02d}"
 
 
+def parse_daily_recap_times(raw: str) -> Optional[List[str]]:
+    parts = [part for part in re.split(r"[\s,;]+", raw.strip()) if part]
+    if not parts:
+        return []
+
+    parsed: List[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        parsed_time = parse_daily_recap_time(part)
+        if parsed_time is None:
+            return None
+        if parsed_time in seen:
+            continue
+        seen.add(parsed_time)
+        parsed.append(parsed_time)
+    return parsed
+
+
+def _coerce_daily_recap_times(value: Any) -> List[str]:
+    if isinstance(value, str):
+        parsed = parse_daily_recap_times(value)
+        return parsed if parsed is not None else []
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        parsed: List[str] = []
+        seen: set[str] = set()
+        for item in value:
+            candidate = parse_daily_recap_time(str(item).strip())
+            if candidate is None or candidate in seen:
+                continue
+            seen.add(candidate)
+            parsed.append(candidate)
+        return parsed
+
+    return []
+
+
 def daily_recap_time_to_time(time_str: str) -> time:
     hour_text, minute_text = time_str.split(":", 1)
     return time(hour=int(hour_text), minute=int(minute_text), tzinfo=timezone.utc)
 
 
-def get_daily_recap_config(user_id: int) -> tuple[bool, str, Optional[int]]:
+def get_daily_recap_config(user_id: int) -> tuple[bool, List[str], Optional[int]]:
     settings = load_settings()
     user_settings = _get_user_settings(settings, user_id)
 
     enabled = bool(user_settings.get("daily_recap_enabled", False))
-    raw_time = str(user_settings.get("daily_recap_time", DEFAULT_DAILY_RECAP_TIME)).strip()
-    recap_time = parse_daily_recap_time(raw_time) or DEFAULT_DAILY_RECAP_TIME
+    recap_times = _coerce_daily_recap_times(user_settings.get("daily_recap_times"))
+    if not recap_times:
+        legacy_raw_time = str(user_settings.get("daily_recap_time", DEFAULT_DAILY_RECAP_TIME)).strip()
+        legacy_time = parse_daily_recap_time(legacy_raw_time)
+        if legacy_time is not None:
+            recap_times = [legacy_time]
+    if not recap_times:
+        recap_times = [DEFAULT_DAILY_RECAP_TIME]
 
     raw_chat_id = user_settings.get("daily_recap_chat_id")
     chat_id: Optional[int]
@@ -432,7 +475,7 @@ def get_daily_recap_config(user_id: int) -> tuple[bool, str, Optional[int]]:
     except (TypeError, ValueError):
         chat_id = None
 
-    return enabled, recap_time, chat_id
+    return enabled, recap_times, chat_id
 
 
 def daily_recap_job_name(user_id: int) -> str:
@@ -467,31 +510,40 @@ def remove_daily_recap_job(application: Application, user_id: int) -> None:
 
 async def daily_recap_fallback_loop(application: Application, user_id: int) -> None:
     while True:
-        enabled, recap_time, chat_id = get_daily_recap_config(user_id)
+        enabled, recap_times, chat_id = get_daily_recap_config(user_id)
         if not enabled:
             return
         if chat_id is None:
             await asyncio.sleep(3600)
             continue
 
-        target_time = daily_recap_time_to_time(recap_time)
         now = datetime.now(timezone.utc)
-        run_at = now.replace(
-            hour=target_time.hour,
-            minute=target_time.minute,
-            second=0,
-            microsecond=0,
-        )
-        if run_at <= now:
-            run_at += timedelta(days=1)
+        candidates: List[tuple[datetime, str]] = []
+        for recap_time in recap_times:
+            target_time = daily_recap_time_to_time(recap_time)
+            run_at = now.replace(
+                hour=target_time.hour,
+                minute=target_time.minute,
+                second=0,
+                microsecond=0,
+            )
+            if run_at <= now:
+                run_at += timedelta(days=1)
+            candidates.append((run_at, recap_time))
+
+        if not candidates:
+            await asyncio.sleep(3600)
+            continue
+
+        run_at, expected_time = min(candidates, key=lambda item: item[0])
 
         delay_seconds = max(1.0, (run_at - now).total_seconds())
         await asyncio.sleep(delay_seconds)
 
-        enabled_now, recap_time_now, chat_id_now = get_daily_recap_config(user_id)
+        enabled_now, recap_times_now, chat_id_now = get_daily_recap_config(user_id)
         if not enabled_now:
             return
-        if recap_time_now != recap_time:
+        if expected_time not in recap_times_now:
             continue
         if chat_id_now is None:
             continue
@@ -507,22 +559,34 @@ def schedule_daily_recap_job(
     application: Application,
     user_id: int,
     chat_id: int,
-    recap_time: str,
+    recap_times: Sequence[str],
 ) -> None:
     remove_daily_recap_job(application, user_id)
+    valid_times: List[str] = []
+    seen: set[str] = set()
+    for recap_time in recap_times:
+        parsed = parse_daily_recap_time(str(recap_time))
+        if parsed is None or parsed in seen:
+            continue
+        seen.add(parsed)
+        valid_times.append(parsed)
+    if not valid_times:
+        valid_times = [DEFAULT_DAILY_RECAP_TIME]
+
     job_queue = _get_job_queue(application)
     if job_queue is not None:
-        job_queue.run_daily(
-            callback=daily_recap_job_callback,
-            time=daily_recap_time_to_time(recap_time),
-            name=daily_recap_job_name(user_id),
-            user_id=user_id,
-            chat_id=chat_id,
-        )
+        for recap_time in valid_times:
+            job_queue.run_daily(
+                callback=daily_recap_job_callback,
+                time=daily_recap_time_to_time(recap_time),
+                name=daily_recap_job_name(user_id),
+                user_id=user_id,
+                chat_id=chat_id,
+            )
         logger.info(
             "Scheduled daily recap (JobQueue) for user %s at %s UTC (chat_id=%s)",
             user_id,
-            recap_time,
+            ",".join(valid_times),
             chat_id,
         )
         return
@@ -543,7 +607,7 @@ def schedule_daily_recap_job(
     logger.info(
         "Scheduled daily recap (fallback loop) for user %s at %s UTC (chat_id=%s)",
         user_id,
-        recap_time,
+        ",".join(valid_times),
         chat_id,
     )
 
@@ -560,7 +624,7 @@ def restore_daily_recap_jobs(application: Application) -> None:
         except ValueError:
             continue
 
-        enabled, recap_time, chat_id = get_daily_recap_config(user_id)
+        enabled, recap_times, chat_id = get_daily_recap_config(user_id)
         remove_daily_recap_job(application, user_id)
 
         if not enabled:
@@ -573,7 +637,7 @@ def restore_daily_recap_jobs(application: Application) -> None:
             continue
 
         try:
-            schedule_daily_recap_job(application, user_id, chat_id, recap_time)
+            schedule_daily_recap_job(application, user_id, chat_id, recap_times)
         except Exception:
             logger.exception("Could not schedule daily recap for user %s", user_id)
 
@@ -1695,7 +1759,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"2. Tap <b>{html.escape(MENU_BTN_TODAY)}</b> for the last 24 hours\n"
             f"3. Tap <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a custom time window\n"
             f"4. Use <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b> and "
-            f"<b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b> for automatic updates\n\n"
+            f"<b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b> for automatic updates at one or more UTC times\n\n"
             "<b>Tip</b>: keyword phrases are supported, e.g. <code>\"quantum mechanics\"</code>."
         )
         await update.message.reply_text(
@@ -1736,8 +1800,8 @@ def build_help_text() -> str:
         f"• <b>{html.escape(MENU_BTN_CLEAR_PUBMED_KEYWORD)}</b>: clear all PubMed keywords\n\n"
         "<b>Recap</b>\n"
         f"• <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b>: toggle daily recap\n"
-        f"• <b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>: set recap time in UTC (HH:MM)\n"
-        f"• <b>{html.escape(MENU_BTN_RECAP_STATUS)}</b>: show recap status and current time\n\n"
+        f"• <b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>: set one or more recap times in UTC (HH:MM)\n"
+        f"• <b>{html.escape(MENU_BTN_RECAP_STATUS)}</b>: show recap status and configured times\n\n"
         "<b>Other</b>\n"
         f"• <b>{html.escape(MENU_BTN_HELP)}</b>: show this guide\n"
         f"• <b>{html.escape(MENU_BTN_COFFEE)}</b>: open support link\n\n"
@@ -1912,6 +1976,44 @@ async def prompt_searchhours_input(update: Update, context: ContextTypes.DEFAULT
         )
 
 
+def build_open_results_markup(hours_back: int) -> InlineKeyboardMarkup:
+    safe_hours = max(1, int(hours_back))
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text=f"Open results ({safe_hours}h)", callback_data=f"open_matches:{safe_hours}")]]
+    )
+
+
+async def send_open_results_prompt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    papers_count: int,
+    hours_back: int,
+) -> None:
+    chat = update.effective_chat
+    if update.message is not None:
+        await update.message.reply_text(
+            (
+                f"<b>Found {papers_count} matching paper(s)</b> in the last "
+                f"<b>{hours_back} hours</b>.\n"
+                "Tap the button below to open results now."
+            ),
+            reply_markup=build_open_results_markup(hours_back),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if chat is not None:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                f"<b>Found {papers_count} matching paper(s)</b> in the last "
+                f"<b>{hours_back} hours</b>.\n"
+                "Tap the button below to open results now."
+            ),
+            reply_markup=build_open_results_markup(hours_back),
+            parse_mode=ParseMode.HTML,
+        )
+
+
 async def apply_keywords_input(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1957,10 +2059,15 @@ async def apply_keywords_input(
             "arXiv:\n- "
             + "\n- ".join(arxiv_keywords if arxiv_keywords else ["(none)"])
             + "\n\nPubMed:\n- "
-            + "\n- ".join(pubmed_keywords if pubmed_keywords else ["(none)"])
-            + f"\n\nFound {len(papers)} matching paper(s).",
+            + "\n- ".join(pubmed_keywords if pubmed_keywords else ["(none)"]),
             reply_markup=build_main_menu_markup(),
         )
+    await send_open_results_prompt(
+        update=update,
+        context=context,
+        papers_count=len(papers),
+        hours_back=int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK)),
+    )
     return True
 
 
@@ -2048,6 +2155,41 @@ async def apply_keywords_input_for_source(
         user_data=context.user_data,
     )
 
+    def _html_bullets(values: Sequence[str]) -> str:
+        return "\n".join(f"• {html.escape(v)}" for v in values)
+
+    body_html = _html_bullets(updated) if updated else "(none)"
+    if mode == "remove":
+        if update.message:
+            lines = [
+                f"<b>Updated {html.escape(source_label)} keywords</b>",
+                "",
+                f"<b>Removed {len(removed)} keyword(s)</b>",
+                _html_bullets(removed),
+            ]
+            if missing:
+                lines.extend(
+                    [
+                        "",
+                        "<b>Not found</b>",
+                        _html_bullets(missing),
+                    ]
+                )
+            lines.extend(
+                [
+                    "",
+                    f"<b>{html.escape(source_label)} keywords</b>",
+                    body_html,
+                ]
+            )
+            await update.message.reply_text(
+                "\n".join(lines),
+                reply_markup=build_main_menu_markup(),
+                parse_mode=ParseMode.HTML,
+            )
+        return True
+
+    # Add mode: refresh now so the user can immediately open matching results.
     try:
         papers = await refresh_cache(update, context)
     except Exception as exc:
@@ -2059,61 +2201,46 @@ async def apply_keywords_input_for_source(
             )
         return False
 
-    body = "\n".join(f"- {k}" for k in updated) if updated else "(none)"
     if update.message:
-        if mode == "add":
-            lines: List[str] = [
-                f"Added {len(added)} keyword(s) to {source_label}:",
-                "- " + "\n- ".join(added),
-            ]
-            if skipped:
-                lines.extend(
-                    [
-                        "",
-                        "Skipped (already present):",
-                        "- " + "\n- ".join(skipped),
-                    ]
-                )
-            lines.extend(
-                [
-                    "",
-                    f"{source_label} keywords:",
-                    body,
-                    "",
-                    f"Found {len(papers)} matching paper(s).",
-                ]
-            )
-            await update.message.reply_text(
-                "\n".join(lines),
-                reply_markup=build_main_menu_markup(),
-            )
-            return True
-
-        lines = [
-            f"Removed {len(removed)} keyword(s) from {source_label}:",
-            "- " + "\n- ".join(removed),
+        hours_back = int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK))
+        lines: List[str] = [
+            f"<b>Added {len(added)} keyword(s) to {html.escape(source_label)}</b>",
+            _html_bullets(added),
         ]
-        if missing:
+        if skipped:
             lines.extend(
                 [
                     "",
-                    "Not found:",
-                    "- " + "\n- ".join(missing),
+                    "<b>Skipped (already present)</b>",
+                    _html_bullets(skipped),
                 ]
             )
         lines.extend(
             [
                 "",
-                f"{source_label} keywords:",
-                body,
+                f"<b>{html.escape(source_label)} keywords</b>",
+                body_html,
                 "",
-                f"Found {len(papers)} matching paper(s).",
+                (
+                    f"<b>Found {len(papers)} matching paper(s)</b> in the last "
+                    f"<b>{hours_back} hours</b>.\n"
+                    "Tap the button below to open results now."
+                ),
             ]
         )
         await update.message.reply_text(
             "\n".join(lines),
-            reply_markup=build_main_menu_markup(),
+            reply_markup=build_open_results_markup(hours_back),
+            parse_mode=ParseMode.HTML,
         )
+        return True
+
+    await send_open_results_prompt(
+        update=update,
+        context=context,
+        papers_count=len(papers),
+        hours_back=int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK)),
+    )
     return True
 
 
@@ -2158,9 +2285,15 @@ async def apply_set_keywords_for_source(
         await update.message.reply_text(
             f"{source_label} keywords set to:\n- "
             + "\n- ".join(updated if updated else ["(none)"])
-            + f"\n\nFound {len(papers)} matching paper(s).",
+            ,
             reply_markup=build_main_menu_markup(),
         )
+    await send_open_results_prompt(
+        update=update,
+        context=context,
+        papers_count=len(papers),
+        hours_back=int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK)),
+    )
     return True
 
 
@@ -2227,21 +2360,9 @@ async def clear_keywords_for_source(
         user_data=context.user_data,
     )
 
-    try:
-        papers = await refresh_cache(update, context)
-    except Exception as exc:
-        logger.exception("Failed to refresh after clearing source keywords")
-        if update.message:
-            await update.message.reply_text(
-                f"{source_label} keywords cleared, but refresh failed:\n{exc}",
-                reply_markup=build_main_menu_markup(),
-            )
-        return False
-
     if update.message:
         await update.message.reply_text(
-            f"Keywords cleared for {source_label}.\n"
-            f"Found {len(papers)} matching paper(s).",
+            f"🧹 Cleared all keywords for {source_label}.",
             reply_markup=build_main_menu_markup(),
         )
     return True
@@ -2285,18 +2406,9 @@ async def clearkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         _save_user_setting(user_id, "custom_keywords", None)
 
-    try:
-        papers = await refresh_cache(update, context)
-    except Exception as exc:
-        logger.exception("Failed to refresh after clearing keywords")
-        if update.message:
-            await update.message.reply_text(f"Keywords cleared, but refresh failed:\n{exc}")
-        return
-
     if update.message:
-        text = "Keywords cleared for both sources."
         await update.message.reply_text(
-            f"{text}\nFound {len(papers)} matching paper(s).",
+            "🧹 Cleared keywords for both sources.",
             reply_markup=build_main_menu_markup(),
         )
 
@@ -2389,15 +2501,16 @@ async def dailyrecap_status_cmd(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text("Could not determine which Telegram user sent this command.")
         return
 
-    enabled, recap_time, chat_id = get_daily_recap_config(user_id)
+    enabled, recap_times, chat_id = get_daily_recap_config(user_id)
     status = "enabled" if enabled else "disabled"
     chat_label = str(chat_id) if chat_id is not None else "(not set)"
+    times_label = ", ".join(recap_times)
 
     if update.message:
         await update.message.reply_text(
             "Daily recap status:\n"
             f"- Status: {status}\n"
-            f"- Time (UTC): {recap_time}\n"
+            f"- Times (UTC): {times_label}\n"
             f"- Chat ID: {chat_label}\n\n"
             f"Use {MENU_BTN_DAILY_RECAP} and {MENU_BTN_SET_RECAP_TIME}.",
             reply_markup=build_main_menu_markup(),
@@ -2410,9 +2523,11 @@ async def prompt_setrecaptime_input(update: Update, context: ContextTypes.DEFAUL
     if update.message:
         await update.message.reply_text(
             "<b>Set Recap Time</b>\n\n"
-            "Send recap time in UTC as HH:MM.\n\n"
-            "<b>Example</b>\n"
-            "<code>09:30</code>",
+            "Send one or more recap times in UTC as HH:MM.\n"
+            "Use commas or spaces to separate multiple times.\n\n"
+            "<b>Examples</b>\n"
+            "<code>09:30</code>\n"
+            "<code>09:30, 21:00</code>",
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
         )
@@ -2430,17 +2545,26 @@ async def apply_recap_time_input(
             await update.message.reply_text("Could not determine user/chat for recap settings.")
         return False
 
-    recap_time = parse_daily_recap_time(raw)
-    if recap_time is None:
+    recap_times = parse_daily_recap_times(raw)
+    if recap_times is None:
         if update.message:
             await update.message.reply_text(
                 "Invalid time format.\n"
-                "Use HH:MM in UTC.\n"
-                "Example: 09:30."
+                "Use one or more HH:MM times in UTC.\n"
+                "Examples: 09:30 or 09:30, 21:00."
+            )
+        return False
+    if not recap_times:
+        if update.message:
+            await update.message.reply_text(
+                "Please provide at least one time.\n"
+                "Example: 09:30 or 09:30, 21:00."
             )
         return False
 
-    _save_user_setting(user_id, "daily_recap_time", recap_time)
+    _save_user_setting(user_id, "daily_recap_times", recap_times)
+    # Keep legacy single-time key for backward compatibility.
+    _save_user_setting(user_id, "daily_recap_time", recap_times[0])
     _save_user_setting(user_id, "daily_recap_chat_id", int(chat.id))
 
     enabled, _, _ = get_daily_recap_config(user_id)
@@ -2450,7 +2574,7 @@ async def apply_recap_time_input(
                 context.application,
                 user_id=user_id,
                 chat_id=int(chat.id),
-                recap_time=recap_time,
+                recap_times=recap_times,
             )
         except Exception as exc:
             logger.exception("Could not reschedule daily recap after time update")
@@ -2459,8 +2583,9 @@ async def apply_recap_time_input(
             return False
 
     if update.message:
+        times_label = ", ".join(recap_times)
         await update.message.reply_text(
-            f"Daily recap time set to {recap_time} UTC."
+            f"Daily recap times set to {times_label} UTC."
             + (" Recap is active." if enabled else " Recap is currently OFF."),
             reply_markup=build_main_menu_markup(),
         )
@@ -2489,9 +2614,10 @@ async def set_daily_recap_enabled(
             await update.message.reply_text("Could not determine user/chat for recap settings.")
         return False
 
-    _, recap_time, _ = get_daily_recap_config(user_id)
+    _, recap_times, _ = get_daily_recap_config(user_id)
     _save_user_setting(user_id, "daily_recap_enabled", bool(enabled))
-    _save_user_setting(user_id, "daily_recap_time", recap_time)
+    _save_user_setting(user_id, "daily_recap_times", recap_times)
+    _save_user_setting(user_id, "daily_recap_time", recap_times[0])
     _save_user_setting(user_id, "daily_recap_chat_id", int(chat.id))
 
     if enabled:
@@ -2500,15 +2626,16 @@ async def set_daily_recap_enabled(
                 context.application,
                 user_id=user_id,
                 chat_id=int(chat.id),
-                recap_time=recap_time,
+                recap_times=recap_times,
             )
         except Exception as exc:
             logger.exception("Could not enable daily recap")
             if update.message:
                 await update.message.reply_text(f"Could not enable daily recap:\n{exc}")
             return False
+        times_label = ", ".join(recap_times)
         message = (
-            f"Daily recap enabled. You will receive updates every day at {recap_time} UTC.\n"
+            f"Daily recap enabled. You will receive updates every day at {times_label} UTC.\n"
             f"Each recap includes papers from the last {DAILY_RECAP_HOURS} hours."
         )
     else:
@@ -2551,6 +2678,36 @@ async def dailyrecap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Use {MENU_BTN_DAILY_RECAP} to toggle recap and {MENU_BTN_RECAP_STATUS} to check status.",
             reply_markup=build_main_menu_markup(),
         )
+
+
+async def open_matches_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    data = query.data or ""
+    if not data.startswith("open_matches:"):
+        await query.answer()
+        return
+
+    raw_hours = data.removeprefix("open_matches:").strip()
+    try:
+        hours_back = int(raw_hours)
+    except ValueError:
+        await query.answer("Invalid range.", show_alert=True)
+        return
+
+    if hours_back <= 0:
+        await query.answer("Invalid range.", show_alert=True)
+        return
+
+    await query.answer("Fetching results...")
+    await run_search_for_hours(
+        update=update,
+        context=context,
+        hours_back=hours_back,
+        force_refresh=True,
+    )
 
 
 async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2705,14 +2862,39 @@ async def run_search_for_hours(
     force_refresh: bool = False,
 ) -> bool:
     user_id = _get_user_id(update)
+    chat = update.effective_chat
+
+    async def send_text(
+        text: str,
+        *,
+        reply_markup: Optional[Any] = None,
+        parse_mode: Optional[str] = None,
+        disable_web_page_preview: Optional[bool] = None,
+    ) -> None:
+        if update.message is not None:
+            await update.message.reply_text(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+            return
+        if chat is not None:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+
     papers = [] if force_refresh else get_cached_papers(context, hours_back=hours_back)
     if not papers:
         try:
             papers = await refresh_cache(update, context, hours_back=hours_back)
         except Exception as exc:
             logger.exception("Search refresh failed")
-            if update.message:
-                await update.message.reply_text(f"Could not fetch papers:\n{exc}")
+            await send_text(f"Could not fetch papers:\n{exc}")
             return False
 
     if not papers:
@@ -2736,28 +2918,25 @@ async def run_search_for_hours(
                 f"Adjust keywords via {MENU_BTN_KEYWORDS} and try again."
             )
 
-        if update.message:
-            await update.message.reply_text(text, reply_markup=build_main_menu_markup())
+        await send_text(text, reply_markup=build_main_menu_markup())
         return True
 
-    if update.message:
-        await update.message.reply_text(
-            f"Found {len(papers)} matching paper(s) in the last {hours_back} hours.",
-            reply_markup=build_main_menu_markup(),
-        )
+    await send_text(
+        f"Found {len(papers)} matching paper(s) in the last {hours_back} hours.",
+        reply_markup=build_main_menu_markup(),
+    )
 
     bookmarks = set(get_bookmarks(context.user_data, user_id=user_id))
     for paper in papers:
-        if update.message:
-            await update.message.reply_text(
-                format_paper_line(paper),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=build_paper_reply_markup(
-                    paper,
-                    bookmarked=paper_ref_for(paper) in bookmarks,
-                ),
-            )
+        await send_text(
+            format_paper_line(paper),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=build_paper_reply_markup(
+                paper,
+                bookmarked=paper_ref_for(paper) in bookmarks,
+            ),
+        )
     return True
 
 
@@ -3014,6 +3193,7 @@ def main() -> None:
     app.add_handler(CommandHandler("debugquery", debugquery_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_router))
+    app.add_handler(CallbackQueryHandler(open_matches_callback, pattern=r"^open_matches:"))
     app.add_handler(CallbackQueryHandler(pdf_callback, pattern=r"^pdf:"))
     app.add_handler(CallbackQueryHandler(bookmark_callback, pattern=r"^bm:"))
 
