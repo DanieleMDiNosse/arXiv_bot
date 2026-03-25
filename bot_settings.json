@@ -1,21 +1,30 @@
 {
-  "custom_keywords": [
-    "finance",
-    "crypto",
-    "defi"
-  ],
   "users": {
-    "373851206": {
+    "6737424044": {
+      "daily_recap_enabled": true,
+      "daily_recap_time": "12:40",
+      "daily_recap_chat_id": 6737424044,
+      "bookmarks": [
+        "pubmed:41876236",
+        "pubmed:41877645"
+      ],
+      "welcome_shown_at": "2026-03-25T15:30:39+00:00",
+      "custom_keywords_arxiv": [
+        "LLM"
+      ]
+    },
+    "405401394": {
       "custom_keywords": [
-        "crypto",
-        "defi"
+        "drug discovery",
+        "generative model"
       ]
     },
     "140139665": {
-      "custom_keywords": [
-        "ethereum"
-      ]
+      "welcome_shown_at": "2026-03-25T15:16:34+00:00"
+    },
+    "914436997": {
+      "welcome_shown_at": "2026-03-25T15:17:34+00:00"
     }
   },
-  "hours_back": 72
+  "hours_back": 24
 }
