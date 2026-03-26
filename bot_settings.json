@@ -49,9 +49,9 @@
     },
     "373851206": {
       "daily_recap_times": [
-        "08:30"
+        "08:00"
       ],
-      "daily_recap_time": "08:30",
+      "daily_recap_time": "08:00",
       "daily_recap_timezone": "Europe/Rome",
       "daily_recap_chat_id": 373851206,
       "daily_recap_enabled": true,
@@ -65,7 +65,8 @@
         "econophysics"
       ],
       "bookmarks": [
-        "arxiv:2603.24137v1"
+        "arxiv:2603.24137v1",
+        "arxiv:2603.23927v1"
       ],
       "welcome_shown_at": "2026-03-26T14:03:01+00:00"
     },

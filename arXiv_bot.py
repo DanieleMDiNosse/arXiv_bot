@@ -113,6 +113,12 @@ KEYWORD_SOURCES_ORDER = [
     SOURCE_CHEMRXIV,
     SOURCE_PUBMED,
 ]
+OPENALEX_SOURCE_IDS = {
+    SOURCE_BIORXIV: "S4306402567",
+    SOURCE_MEDRXIV: "S3005729997",
+    SOURCE_CHEMRXIV: "S4393918830",
+    SOURCE_SSRN: "S4210172589",
+}
 
 
 def build_main_menu_markup() -> ReplyKeyboardMarkup:
@@ -1206,71 +1212,16 @@ def fetch_recent_rxiv_papers(
     source_norm = str(source).casefold()
     if source_norm not in {SOURCE_BIORXIV, SOURCE_MEDRXIV}:
         return [], "", 0
-
-    host = f"www.{source_norm}.org"
-    now_utc = datetime.now(timezone.utc)
-    cutoff = now_utc - timedelta(hours=hours_back)
-    # API filtering is day-based; widen window by one day and filter by hour locally.
-    from_date = (cutoff - timedelta(days=1)).date().isoformat()
-    to_date = now_utc.date().isoformat()
-
-    papers: List[Paper] = []
-    seen_refs: set[str] = set()
-    request_urls: List[str] = []
-    raw_count = 0
-    cursor = 0
-
-    while len(papers) < max_results:
-        response = requests.get(
-            f"{RXIV_DETAILS_API_URL}/{source_norm}/{from_date}/{to_date}/{cursor}",
-            timeout=30,
-            headers={"User-Agent": "telegram-arxiv-codex-bot/1.0"},
-        )
-        response.raise_for_status()
-        payload = response.json()
-        request_urls.append(response.url)
-
-        collection = payload.get("collection", [])
-        if not isinstance(collection, list) or not collection:
-            break
-
-        raw_count += len(collection)
-        for item in collection:
-            if not isinstance(item, dict):
-                continue
-            paper = _rxiv_record_to_paper(item, source=source_norm, host=host)
-            if paper is None:
-                continue
-            if paper.published < cutoff:
-                continue
-            if not _keywords_match_text(keywords, f"{paper.title}\n{paper.summary}"):
-                continue
-            ref = paper_ref_for(paper)
-            if ref in seen_refs:
-                continue
-            seen_refs.add(ref)
-            papers.append(paper)
-            if len(papers) >= max_results:
-                break
-
-        message_meta = payload.get("messages", [])
-        total_count = 0
-        if isinstance(message_meta, list) and message_meta and isinstance(message_meta[0], dict):
-            try:
-                total_count = int(message_meta[0].get("count", 0) or 0)
-            except Exception:
-                total_count = 0
-
-        cursor += len(collection)
-        if total_count > 0 and cursor >= total_count:
-            break
-
-    papers.sort(key=lambda paper: paper.published, reverse=True)
-    for idx, paper in enumerate(papers, start=1):
-        paper.index = idx
-
-    request_url = "\n".join(request_urls)
-    return papers, request_url, raw_count
+    # bioRxiv/medRxiv's official details endpoint exposes date windows but no
+    # title/abstract keyword query. Use OpenAlex source-scoped search so these
+    # sources match arXiv's "keyword query first, local recency filter second"
+    # behavior.
+    return _fetch_recent_openalex_preprint_papers(
+        source=source_norm,
+        keywords=keywords,
+        hours_back=hours_back,
+        max_results=max_results,
+    )
 
 
 def _crossref_item_to_preprint_paper(
@@ -1453,9 +1404,8 @@ def fetch_recent_chemrxiv_papers(
     hours_back: int,
     max_results: int = DEFAULT_MAX_RESULTS,
 ) -> tuple[list[Paper], str, int]:
-    return fetch_recent_crossref_preprint_papers(
+    return _fetch_recent_openalex_preprint_papers(
         source=SOURCE_CHEMRXIV,
-        doi_prefix="10.26434",
         keywords=keywords,
         hours_back=hours_back,
         max_results=max_results,
@@ -1514,13 +1464,20 @@ def _openalex_item_to_preprint_paper(item: dict[str, Any], *, source: str) -> Op
 
     primary_location = item.get("primary_location")
     best_oa_location = item.get("best_oa_location")
+    content_urls = item.get("content_urls")
     link_pdf = ""
     if isinstance(primary_location, dict):
         link_pdf = normalize_text(str(primary_location.get("pdf_url") or ""))
     if not link_pdf and isinstance(best_oa_location, dict):
         link_pdf = normalize_text(str(best_oa_location.get("pdf_url") or ""))
+    if not link_pdf and isinstance(content_urls, dict):
+        link_pdf = normalize_text(str(content_urls.get("pdf") or ""))
 
-    link_abs = normalize_text(str(item.get("id") or ""))
+    link_abs = ""
+    if isinstance(primary_location, dict):
+        link_abs = normalize_text(str(primary_location.get("landing_page_url") or ""))
+    if not link_abs and isinstance(best_oa_location, dict):
+        link_abs = normalize_text(str(best_oa_location.get("landing_page_url") or ""))
     if not link_abs:
         link_abs = f"https://doi.org/{doi}"
 
@@ -1551,19 +1508,144 @@ def _openalex_item_to_preprint_paper(item: dict[str, Any], *, source: str) -> Op
 
 
 def _keywords_to_openalex_search_query(keywords: Sequence[str]) -> str:
-    terms: List[str] = []
-    seen: set[str] = set()
+    clauses: List[str] = []
+    seen_clauses: set[str] = set()
     for keyword in keywords:
+        term_clauses: List[str] = []
         for part in str(keyword).split("+"):
             cleaned = normalize_text(part).strip('"').strip("'").strip()
             if not cleaned:
                 continue
-            key = cleaned.casefold()
-            if key in seen:
+            sanitized = cleaned.replace('"', "")
+            if not sanitized:
                 continue
-            seen.add(key)
-            terms.append(cleaned)
-    return " ".join(terms)
+            term_clauses.append(f'"{sanitized}"')
+
+        if not term_clauses:
+            continue
+
+        clause = term_clauses[0] if len(term_clauses) == 1 else "(" + " AND ".join(term_clauses) + ")"
+        clause_key = clause.casefold()
+        if clause_key in seen_clauses:
+            continue
+        seen_clauses.add(clause_key)
+        clauses.append(clause)
+
+    if not clauses:
+        return ""
+    if len(clauses) == 1:
+        return clauses[0]
+    return "(" + " OR ".join(clauses) + ")"
+
+
+def _openalex_preprint_window_timestamp(paper: Paper) -> datetime:
+    if paper.source.casefold() == SOURCE_SSRN:
+        return _paper_recency_timestamp(paper, prefer_updated_for_arxiv=False)
+    return paper.published
+
+
+def _fetch_recent_openalex_preprint_papers(
+    source: str,
+    keywords: Sequence[str],
+    hours_back: int,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    source_norm = str(source).casefold()
+    source_id = OPENALEX_SOURCE_IDS.get(source_norm, "")
+    search_query = _keywords_to_openalex_search_query(keywords)
+    if not source_id or not search_query:
+        return [], "", 0
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(hours=hours_back)
+
+    rows = max(1, min(200, int(max_results)))
+    cursor = "*"
+    papers: List[Paper] = []
+    seen_refs: set[str] = set()
+    request_urls: List[str] = []
+    raw_count = 0
+
+    # Cursor pagination; keep a hard cap to avoid runaway loops.
+    for _ in range(20):
+        params: dict[str, Any] = {
+            "filter": f"primary_location.source.id:{source_id}",
+            "per-page": rows,
+            "cursor": cursor,
+            "sort": "publication_date:desc",
+            "search": search_query,
+        }
+
+        openalex_mailto = normalize_text(os.getenv("OPENALEX_MAILTO", ""))
+        if openalex_mailto:
+            params["mailto"] = openalex_mailto
+
+        response: Optional[requests.Response] = None
+        for attempt in range(3):
+            candidate = requests.get(
+                OPENALEX_WORKS_URL,
+                params=params,
+                timeout=30,
+                headers={"User-Agent": "telegram-arxiv-codex-bot/1.0"},
+            )
+            if candidate.status_code != 429:
+                response = candidate
+                break
+            # Respect rate limiting with a small exponential backoff.
+            wait_seconds = 2 * (attempt + 1)
+            logger.warning("OpenAlex rate-limited request. Retrying in %ss.", wait_seconds)
+            systime.sleep(wait_seconds)
+            response = candidate
+
+        if response is None:
+            break
+        response.raise_for_status()
+        payload = response.json()
+        request_urls.append(response.url)
+
+        items = payload.get("results", [])
+        if not isinstance(items, list) or not items:
+            break
+
+        raw_count += len(items)
+        reached_older_records = False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            paper = _openalex_item_to_preprint_paper(item, source=source_norm)
+            if paper is None:
+                continue
+
+            recency = _openalex_preprint_window_timestamp(paper)
+            if recency < cutoff:
+                reached_older_records = True
+                break
+
+            ref = paper_ref_for(paper)
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            papers.append(paper)
+            if len(papers) >= max_results:
+                break
+
+        if len(papers) >= max_results or reached_older_records:
+            break
+
+        meta = payload.get("meta", {})
+        if not isinstance(meta, dict):
+            break
+        next_cursor = normalize_text(str(meta.get("next_cursor") or ""))
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
+    papers.sort(key=_openalex_preprint_window_timestamp, reverse=True)
+    for idx, paper in enumerate(papers, start=1):
+        paper.index = idx
+
+    request_url = "\n".join(request_urls)
+    return papers, request_url, raw_count
 
 
 def fetch_recent_ssrn_papers_openalex(
