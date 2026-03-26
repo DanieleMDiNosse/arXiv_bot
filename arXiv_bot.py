@@ -3310,7 +3310,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if is_first_open:
         welcome_text = (
-            "<b>Welcome to dailyArXiv</b>\n\n"
+            "<b>Welcome to Scholar Stream</b>\n\n"
             "Track new papers from arXiv, bioRxiv, medRxiv, ChemRxiv, SSRN, IEEE, and PubMed using your own keywords.\n\n"
             "<b>Initial Setup (do this first)</b>\n"
             f"1. Open <b>{html.escape(MENU_BTN_ADD_KEYWORDS)}</b>, then choose a source (or All sources)\n"

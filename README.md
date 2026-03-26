@@ -1,6 +1,6 @@
-# dailyArXiv
+# Scholar Stream
 
-`dailyArXiv` is a Telegram bot for researchers who want a lightweight way to monitor fresh papers across multiple academic sources without building a full alerting pipeline.
+`Scholar Stream` is a Telegram bot for researchers who want a lightweight way to monitor fresh papers across multiple academic sources without building a full alerting pipeline.
 
 > Track fresh papers across preprint servers, journals, and indexes directly from Telegram.
 
