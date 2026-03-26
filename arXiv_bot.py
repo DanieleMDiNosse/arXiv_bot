@@ -94,6 +94,7 @@ SOURCE_MEDRXIV = "medrxiv"
 SOURCE_CHEMRXIV = "chemrxiv"
 SOURCE_SSRN = "ssrn"
 SOURCE_PUBMED = "pubmed"
+SOURCE_IEEE = "ieee"
 KEYWORD_SCOPE_ALL = "all"
 WELCOME_SHOWN_AT_KEY = "welcome_shown_at"
 SEARCH_SCOPE_TODAY = "today"
@@ -105,12 +106,14 @@ ARXIV_FAMILY_SOURCES = {
     SOURCE_MEDRXIV,
     SOURCE_CHEMRXIV,
 }
-ALL_PAPER_SOURCES = ARXIV_FAMILY_SOURCES | {SOURCE_PUBMED}
+ALL_PAPER_SOURCES = ARXIV_FAMILY_SOURCES | {SOURCE_SSRN, SOURCE_IEEE, SOURCE_PUBMED}
 KEYWORD_SOURCES_ORDER = [
     SOURCE_ARXIV,
     SOURCE_BIORXIV,
     SOURCE_MEDRXIV,
     SOURCE_CHEMRXIV,
+    SOURCE_SSRN,
+    SOURCE_IEEE,
     SOURCE_PUBMED,
 ]
 OPENALEX_SOURCE_IDS = {
@@ -157,6 +160,10 @@ def build_keyword_scope_markup(action: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="medRxiv", callback_data=f"kwmenu:{action_norm}:{SOURCE_MEDRXIV}"),
             InlineKeyboardButton(text="ChemRxiv", callback_data=f"kwmenu:{action_norm}:{SOURCE_CHEMRXIV}"),
+        ],
+        [
+            InlineKeyboardButton(text="SSRN", callback_data=f"kwmenu:{action_norm}:{SOURCE_SSRN}"),
+            InlineKeyboardButton(text="IEEE", callback_data=f"kwmenu:{action_norm}:{SOURCE_IEEE}"),
         ],
         [
             InlineKeyboardButton(text="PubMed", callback_data=f"kwmenu:{action_norm}:{SOURCE_PUBMED}"),
@@ -477,6 +484,8 @@ def paper_source_label(source: str) -> str:
     source_norm = str(source).casefold()
     if source_norm == SOURCE_PUBMED:
         return "PubMed"
+    if source_norm == SOURCE_IEEE:
+        return "IEEE"
     if source_norm == SOURCE_BIORXIV:
         return "bioRxiv"
     if source_norm == SOURCE_MEDRXIV:
@@ -573,6 +582,10 @@ def parse_keyword_source(raw: str) -> Optional[str]:
         return SOURCE_MEDRXIV
     if token in {"chemrxiv", "chem", "cx"}:
         return SOURCE_CHEMRXIV
+    if token in {"ssrn", "sr"}:
+        return SOURCE_SSRN
+    if token in {"ieee", "ie", "xplore", "ix"}:
+        return SOURCE_IEEE
     if token in {"pubmed", "pm"}:
         return SOURCE_PUBMED
     if token in {"all", "*"}:
@@ -632,6 +645,8 @@ def get_keywords_for_source(
         SOURCE_BIORXIV: "BIORXIV_KEYWORDS",
         SOURCE_MEDRXIV: "MEDRXIV_KEYWORDS",
         SOURCE_CHEMRXIV: "CHEMRXIV_KEYWORDS",
+        SOURCE_SSRN: "SSRN_KEYWORDS",
+        SOURCE_IEEE: "IEEE_KEYWORDS",
         SOURCE_PUBMED: "PUBMED_KEYWORDS",
     }
     raw = os.getenv(env_name_map[source_norm], "").strip()
@@ -1118,6 +1133,22 @@ def _keywords_match_text(keywords: Sequence[str], text: str) -> bool:
     return False
 
 
+def _keywords_to_search_query(keywords: Sequence[str]) -> str:
+    terms: List[str] = []
+    seen: set[str] = set()
+    for keyword in keywords:
+        for part in str(keyword).split("+"):
+            cleaned = normalize_text(part).strip('"').strip("'").strip()
+            if not cleaned:
+                continue
+            key = cleaned.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            terms.append(cleaned)
+    return " ".join(terms)
+
+
 def _parse_datetime_or_none(raw: Any) -> Optional[datetime]:
     text = normalize_text(str(raw or ""))
     if not text:
@@ -1320,6 +1351,7 @@ def fetch_recent_crossref_preprint_papers(
     doi_prefix: str,
     keywords: Sequence[str],
     hours_back: int,
+    query_text: str = "",
     max_results: int = DEFAULT_MAX_RESULTS,
 ) -> tuple[list[Paper], str, int]:
     now_utc = datetime.now(timezone.utc)
@@ -1343,10 +1375,12 @@ def fetch_recent_crossref_preprint_papers(
             "rows": rows,
             "cursor": cursor,
             "select": (
-                "DOI,title,abstract,author,created,updated,indexed,"
+                "DOI,title,abstract,author,created,indexed,"
                 "published-online,published-print,posted,issued,URL,link,container-title"
             ),
         }
+        if query_text:
+            params["query.bibliographic"] = query_text
         response = requests.get(
             CROSSREF_WORKS_URL,
             params=params,
@@ -1408,6 +1442,23 @@ def fetch_recent_chemrxiv_papers(
         source=SOURCE_CHEMRXIV,
         keywords=keywords,
         hours_back=hours_back,
+        max_results=max_results,
+    )
+
+
+def fetch_recent_ieee_papers(
+    keywords: Sequence[str],
+    hours_back: int,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    # IEEE content is indexed in Crossref primarily under DOI prefix 10.1109.
+    query_text = _keywords_to_search_query(keywords)
+    return fetch_recent_crossref_preprint_papers(
+        source=SOURCE_IEEE,
+        doi_prefix="10.1109",
+        keywords=keywords,
+        hours_back=hours_back,
+        query_text=query_text,
         max_results=max_results,
     )
 
@@ -1755,10 +1806,14 @@ def fetch_recent_ssrn_papers(
     hours_back: int,
     max_results: int = DEFAULT_MAX_RESULTS,
 ) -> tuple[list[Paper], str, int]:
-    # SSRN is fetched only via OpenAlex (no Crossref fallback).
-    return fetch_recent_ssrn_papers_openalex(
+    # SSRN is fetched via Crossref DOI prefix 10.2139.
+    query_text = _keywords_to_search_query(keywords)
+    return fetch_recent_crossref_preprint_papers(
+        source=SOURCE_SSRN,
+        doi_prefix="10.2139",
         keywords=keywords,
         hours_back=hours_back,
+        query_text=query_text,
         max_results=max_results,
     )
 
@@ -2582,6 +2637,8 @@ async def refresh_cache(
     biorxiv_keywords = keywords_by_source.get(SOURCE_BIORXIV, [])
     medrxiv_keywords = keywords_by_source.get(SOURCE_MEDRXIV, [])
     chemrxiv_keywords = keywords_by_source.get(SOURCE_CHEMRXIV, [])
+    ssrn_keywords = keywords_by_source.get(SOURCE_SSRN, [])
+    ieee_keywords = keywords_by_source.get(SOURCE_IEEE, [])
     pubmed_keywords = keywords_by_source.get(SOURCE_PUBMED, [])
 
     arxiv_query = build_arxiv_query(keywords=arxiv_keywords)
@@ -2592,6 +2649,8 @@ async def refresh_cache(
             biorxiv_keywords,
             medrxiv_keywords,
             chemrxiv_keywords,
+            ssrn_keywords,
+            ieee_keywords,
         ]
     )
 
@@ -2609,13 +2668,15 @@ async def refresh_cache(
     logger.info(
         (
             "Refreshing paper cache for user %s "
-            "(arXiv=%s, bioRxiv=%s, medRxiv=%s, ChemRxiv=%s, PubMed=%s)"
+            "(arXiv=%s, bioRxiv=%s, medRxiv=%s, ChemRxiv=%s, SSRN=%s, IEEE=%s, PubMed=%s)"
         ),
         user_id,
         bool(arxiv_query),
         bool(biorxiv_keywords),
         bool(medrxiv_keywords),
         bool(chemrxiv_keywords),
+        bool(ssrn_keywords),
+        bool(ieee_keywords),
         bool(pubmed_query),
     )
 
@@ -2631,6 +2692,12 @@ async def refresh_cache(
     chemrxiv_papers: List[Paper] = []
     chemrxiv_request_url = ""
     chemrxiv_raw_count = 0
+    ssrn_papers: List[Paper] = []
+    ssrn_request_url = ""
+    ssrn_raw_count = 0
+    ieee_papers: List[Paper] = []
+    ieee_request_url = ""
+    ieee_raw_count = 0
     preprint_fetches: List[tuple[str, Any]] = []
     if arxiv_query:
         preprint_fetches.append(
@@ -2682,6 +2749,30 @@ async def refresh_cache(
                 ),
             )
         )
+    if ssrn_keywords:
+        preprint_fetches.append(
+            (
+                SOURCE_SSRN,
+                asyncio.to_thread(
+                    fetch_recent_ssrn_papers,
+                    ssrn_keywords,
+                    effective_hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if ieee_keywords:
+        preprint_fetches.append(
+            (
+                SOURCE_IEEE,
+                asyncio.to_thread(
+                    fetch_recent_ieee_papers,
+                    ieee_keywords,
+                    effective_hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
     if preprint_fetches:
         preprint_results = await asyncio.gather(
             *(task for _source, task in preprint_fetches),
@@ -2712,6 +2803,12 @@ async def refresh_cache(
             if source == SOURCE_CHEMRXIV:
                 chemrxiv_papers, chemrxiv_request_url, chemrxiv_raw_count = result
                 continue
+            if source == SOURCE_SSRN:
+                ssrn_papers, ssrn_request_url, ssrn_raw_count = result
+                continue
+            if source == SOURCE_IEEE:
+                ieee_papers, ieee_request_url, ieee_raw_count = result
+                continue
     pubmed_papers: List[Paper] = []
     pubmed_request_url = ""
     pubmed_raw_count = 0
@@ -2723,7 +2820,7 @@ async def refresh_cache(
             DEFAULT_MAX_RESULTS,
         )
 
-    papers = arxiv_papers + biorxiv_papers + medrxiv_papers + chemrxiv_papers + pubmed_papers
+    papers = arxiv_papers + biorxiv_papers + medrxiv_papers + chemrxiv_papers + ssrn_papers + ieee_papers + pubmed_papers
     papers.sort(
         key=lambda paper: _paper_recency_timestamp(
             paper,
@@ -2743,6 +2840,10 @@ async def refresh_cache(
         query_lines.append(f"medRxiv keywords: {', '.join(medrxiv_keywords)}")
     if chemrxiv_keywords:
         query_lines.append(f"ChemRxiv keywords: {', '.join(chemrxiv_keywords)}")
+    if ssrn_keywords:
+        query_lines.append(f"SSRN keywords: {', '.join(ssrn_keywords)}")
+    if ieee_keywords:
+        query_lines.append(f"IEEE keywords: {', '.join(ieee_keywords)}")
     if pubmed_query:
         query_lines.append(f"PubMed: {pubmed_query}")
 
@@ -2755,6 +2856,10 @@ async def refresh_cache(
         request_lines.append(f"medRxiv: {medrxiv_request_url}")
     if chemrxiv_request_url:
         request_lines.append(f"ChemRxiv: {chemrxiv_request_url}")
+    if ssrn_request_url:
+        request_lines.append(f"SSRN: {ssrn_request_url}")
+    if ieee_request_url:
+        request_lines.append(f"IEEE: {ieee_request_url}")
     if pubmed_request_url:
         request_lines.append(f"PubMed: {pubmed_request_url}")
 
@@ -2763,6 +2868,8 @@ async def refresh_cache(
         "biorxiv": biorxiv_raw_count,
         "medrxiv": medrxiv_raw_count,
         "chemrxiv": chemrxiv_raw_count,
+        "ssrn": ssrn_raw_count,
+        "ieee": ieee_raw_count,
         "pubmed": pubmed_raw_count,
     }
     raw_total = (
@@ -2770,6 +2877,8 @@ async def refresh_cache(
         + biorxiv_raw_count
         + medrxiv_raw_count
         + chemrxiv_raw_count
+        + ssrn_raw_count
+        + ieee_raw_count
         + pubmed_raw_count
     )
 
@@ -2793,6 +2902,8 @@ async def fetch_recent_papers_for_user(
     biorxiv_keywords = get_keywords_for_source(SOURCE_BIORXIV, user_id=user_id)
     medrxiv_keywords = get_keywords_for_source(SOURCE_MEDRXIV, user_id=user_id)
     chemrxiv_keywords = get_keywords_for_source(SOURCE_CHEMRXIV, user_id=user_id)
+    ssrn_keywords = get_keywords_for_source(SOURCE_SSRN, user_id=user_id)
+    ieee_keywords = get_keywords_for_source(SOURCE_IEEE, user_id=user_id)
     pubmed_keywords = get_keywords_for_pubmed(user_id=user_id)
     arxiv_query = build_arxiv_query(keywords=arxiv_keywords)
     pubmed_query = build_pubmed_query(keywords=pubmed_keywords)
@@ -2802,6 +2913,8 @@ async def fetch_recent_papers_for_user(
             biorxiv_keywords,
             medrxiv_keywords,
             chemrxiv_keywords,
+            ssrn_keywords,
+            ieee_keywords,
         ]
     )
     if not has_preprint_queries and not pubmed_query:
@@ -2815,6 +2928,10 @@ async def fetch_recent_papers_for_user(
     medrxiv_raw = 0
     chemrxiv_papers: List[Paper] = []
     chemrxiv_raw = 0
+    ssrn_papers: List[Paper] = []
+    ssrn_raw = 0
+    ieee_papers: List[Paper] = []
+    ieee_raw = 0
     preprint_fetches: List[tuple[str, Any]] = []
     if arxiv_query:
         preprint_fetches.append(
@@ -2866,6 +2983,30 @@ async def fetch_recent_papers_for_user(
                 ),
             )
         )
+    if ssrn_keywords:
+        preprint_fetches.append(
+            (
+                SOURCE_SSRN,
+                asyncio.to_thread(
+                    fetch_recent_ssrn_papers,
+                    ssrn_keywords,
+                    hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if ieee_keywords:
+        preprint_fetches.append(
+            (
+                SOURCE_IEEE,
+                asyncio.to_thread(
+                    fetch_recent_ieee_papers,
+                    ieee_keywords,
+                    hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
     if preprint_fetches:
         preprint_results = await asyncio.gather(
             *(task for _source, task in preprint_fetches),
@@ -2889,6 +3030,12 @@ async def fetch_recent_papers_for_user(
             if source == SOURCE_CHEMRXIV:
                 chemrxiv_papers, _chemrxiv_url, chemrxiv_raw = result
                 continue
+            if source == SOURCE_SSRN:
+                ssrn_papers, _ssrn_url, ssrn_raw = result
+                continue
+            if source == SOURCE_IEEE:
+                ieee_papers, _ieee_url, ieee_raw = result
+                continue
     pubmed_papers: List[Paper] = []
     pubmed_raw = 0
     if pubmed_query:
@@ -2899,7 +3046,7 @@ async def fetch_recent_papers_for_user(
             DEFAULT_MAX_RESULTS,
         )
 
-    papers = arxiv_papers + biorxiv_papers + medrxiv_papers + chemrxiv_papers + pubmed_papers
+    papers = arxiv_papers + biorxiv_papers + medrxiv_papers + chemrxiv_papers + ssrn_papers + ieee_papers + pubmed_papers
     papers.sort(
         key=lambda paper: _paper_recency_timestamp(paper, prefer_updated_for_arxiv=True),
         reverse=True,
@@ -2916,6 +3063,10 @@ async def fetch_recent_papers_for_user(
         query_lines.append(f"medRxiv keywords: {', '.join(medrxiv_keywords)}")
     if chemrxiv_keywords:
         query_lines.append(f"ChemRxiv keywords: {', '.join(chemrxiv_keywords)}")
+    if ssrn_keywords:
+        query_lines.append(f"SSRN keywords: {', '.join(ssrn_keywords)}")
+    if ieee_keywords:
+        query_lines.append(f"IEEE keywords: {', '.join(ieee_keywords)}")
     if pubmed_query:
         query_lines.append(f"PubMed: {pubmed_query}")
 
@@ -2924,9 +3075,11 @@ async def fetch_recent_papers_for_user(
         "biorxiv": biorxiv_raw,
         "medrxiv": medrxiv_raw,
         "chemrxiv": chemrxiv_raw,
+        "ssrn": ssrn_raw,
+        "ieee": ieee_raw,
         "pubmed": pubmed_raw,
     }
-    raw_total = arxiv_raw + biorxiv_raw + medrxiv_raw + chemrxiv_raw + pubmed_raw
+    raw_total = arxiv_raw + biorxiv_raw + medrxiv_raw + chemrxiv_raw + ssrn_raw + ieee_raw + pubmed_raw
     return papers, "\n".join(query_lines), raw_total, raw_breakdown
 
 
@@ -3076,7 +3229,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_first_open:
         welcome_text = (
             "<b>Welcome to dailyArXiv</b>\n\n"
-            "Track new papers from arXiv, bioRxiv, medRxiv, ChemRxiv, and PubMed using your own keywords.\n\n"
+            "Track new papers from arXiv, bioRxiv, medRxiv, ChemRxiv, SSRN, IEEE, and PubMed using your own keywords.\n\n"
             "<b>Initial Setup (do this first)</b>\n"
             f"1. Open <b>{html.escape(MENU_BTN_ADD_KEYWORDS)}</b>, then choose a source (or All sources)\n"
             f"2. Check results with <b>{html.escape(MENU_BTN_TODAY)}</b> "
@@ -3122,7 +3275,7 @@ def build_help_text() -> str:
         f"3. Configure automatic updates with <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b> and "
         f"<b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>\n\n"
         "<b>Search & Results</b>\n"
-        f"• <b>{html.escape(MENU_BTN_TODAY)}</b>: show the last {TODAY_HOURS_BACK} hours on arXiv, bioRxiv, medRxiv, ChemRxiv, and PubMed\n"
+        f"• <b>{html.escape(MENU_BTN_TODAY)}</b>: show the last {TODAY_HOURS_BACK} hours on arXiv, bioRxiv, medRxiv, ChemRxiv, SSRN, IEEE, and PubMed\n"
         f"• <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b>: choose a custom time range\n"
         f"• <b>{html.escape(MENU_BTN_KEYWORDS)}</b>: show your current keyword lists\n"
         f"• <b>{html.escape(MENU_BTN_BOOKMARKS)}</b>: show saved papers\n\n"
@@ -4031,6 +4184,8 @@ async def setkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     "biorxiv kw1, kw2 + kw3\n"
                     "medrxiv kw1, kw2 + kw3\n"
                     "chemrxiv kw1, kw2 + kw3\n"
+                    "ssrn kw1, kw2 + kw3\n"
+                    "ieee kw1, kw2 + kw3\n"
                     "pubmed kw1, kw2 + kw3\n\n"
                     "all kw1, kw2 + kw3\n\n"
                     "Use commas for separate alternatives (OR). Use + to search terms together (AND) in one entry.\n\n"
@@ -4109,6 +4264,8 @@ async def clearkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 "- biorxiv\n"
                 "- medrxiv\n"
                 "- chemrxiv\n"
+                "- ssrn\n"
+                "- ieee\n"
                 "- pubmed\n\n"
                 "Or use: all\n\n"
                 "Or use the clear buttons in the menu.",
@@ -4146,6 +4303,8 @@ async def addkeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "biorxiv microbiome\n"
                 "medrxiv sepsis\n"
                 "chemrxiv catalyst\n"
+                "ssrn market microstructure\n"
+                "ieee federated learning\n"
                 "pubmed genetics\n\n"
                 "all llm, diffusion model\n\n"
                 "Use commas for separate alternatives (OR). Use + to search terms together (AND) in one entry.\n\n"
@@ -4157,7 +4316,7 @@ async def addkeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if source is None:
         if update.message:
             await update.message.reply_text(
-                "Source must be one of: arxiv, biorxiv, medrxiv, chemrxiv, pubmed, all.",
+                "Source must be one of: arxiv, biorxiv, medrxiv, chemrxiv, ssrn, ieee, pubmed, all.",
                 reply_markup=build_main_menu_markup(),
             )
         return
@@ -4181,6 +4340,8 @@ async def removekeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 "biorxiv microbiome\n"
                 "medrxiv sepsis\n"
                 "chemrxiv catalyst\n"
+                "ssrn market microstructure\n"
+                "ieee federated learning\n"
                 "pubmed genetics\n\n"
                 "all llm, diffusion model\n\n"
                 "When removing keywords, use the saved clause exactly.\n\n"
@@ -4192,7 +4353,7 @@ async def removekeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if source is None:
         if update.message:
             await update.message.reply_text(
-                "Source must be one of: arxiv, biorxiv, medrxiv, chemrxiv, pubmed, all.",
+                "Source must be one of: arxiv, biorxiv, medrxiv, chemrxiv, ssrn, ieee, pubmed, all.",
                 reply_markup=build_main_menu_markup(),
             )
         return
@@ -4890,6 +5051,8 @@ async def debugquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     biorxiv_keywords = keywords_by_source.get(SOURCE_BIORXIV, [])
     medrxiv_keywords = keywords_by_source.get(SOURCE_MEDRXIV, [])
     chemrxiv_keywords = keywords_by_source.get(SOURCE_CHEMRXIV, [])
+    ssrn_keywords = keywords_by_source.get(SOURCE_SSRN, [])
+    ieee_keywords = keywords_by_source.get(SOURCE_IEEE, [])
     pubmed_keywords = keywords_by_source.get(SOURCE_PUBMED, [])
     hours_back = int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK))
     scope = _normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY))
@@ -4906,6 +5069,10 @@ async def debugquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             query_lines.append(f"medRxiv keywords: {', '.join(medrxiv_keywords)}")
         if chemrxiv_keywords:
             query_lines.append(f"ChemRxiv keywords: {', '.join(chemrxiv_keywords)}")
+        if ssrn_keywords:
+            query_lines.append(f"SSRN keywords: {', '.join(ssrn_keywords)}")
+        if ieee_keywords:
+            query_lines.append(f"IEEE keywords: {', '.join(ieee_keywords)}")
         if pubmed_query:
             query_lines.append(f"PubMed: {pubmed_query}")
         query = "\n".join(query_lines) if query_lines else "(no active query)"
@@ -4914,12 +5081,16 @@ async def debugquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     biorxiv_raw = 0
     medrxiv_raw = 0
     chemrxiv_raw = 0
+    ssrn_raw = 0
+    ieee_raw = 0
     pubmed_raw = 0
     if isinstance(raw_breakdown, dict):
         arxiv_raw = int(raw_breakdown.get("arxiv", 0) or 0)
         biorxiv_raw = int(raw_breakdown.get("biorxiv", 0) or 0)
         medrxiv_raw = int(raw_breakdown.get("medrxiv", 0) or 0)
         chemrxiv_raw = int(raw_breakdown.get("chemrxiv", 0) or 0)
+        ssrn_raw = int(raw_breakdown.get("ssrn", 0) or 0)
+        ieee_raw = int(raw_breakdown.get("ieee", 0) or 0)
         pubmed_raw = int(raw_breakdown.get("pubmed", 0) or 0)
 
     msg = (
@@ -4929,6 +5100,8 @@ async def debugquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"bioRxiv keywords: {biorxiv_keywords if biorxiv_keywords else '(none)'}\n"
         f"medRxiv keywords: {medrxiv_keywords if medrxiv_keywords else '(none)'}\n"
         f"ChemRxiv keywords: {chemrxiv_keywords if chemrxiv_keywords else '(none)'}\n"
+        f"SSRN keywords: {ssrn_keywords if ssrn_keywords else '(none)'}\n"
+        f"IEEE keywords: {ieee_keywords if ieee_keywords else '(none)'}\n"
         f"PubMed keywords: {pubmed_keywords if pubmed_keywords else '(none)'}\n\n"
         f"Current queries:\n{query}\n\n"
         f"Last raw entry count: {raw_count} "
@@ -4937,6 +5110,8 @@ async def debugquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"bioRxiv: {biorxiv_raw}, "
         f"medRxiv: {medrxiv_raw}, "
         f"ChemRxiv: {chemrxiv_raw}, "
+        f"SSRN: {ssrn_raw}, "
+        f"IEEE: {ieee_raw}, "
         f"PubMed: {pubmed_raw}"
         ")"
     )

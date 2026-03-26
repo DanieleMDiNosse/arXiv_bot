@@ -26,19 +26,15 @@
         "pubmed:41840968",
         "pubmed:41840485"
       ],
-      "custom_keywords_arxiv": [
-        "crypto",
-        "ethereum"
+      "custom_keywords_arxiv": [],
+      "custom_keywords_biorxiv": [
+        "cellular",
+        "cancer"
       ],
-      "custom_keywords_biorxiv": [],
       "custom_keywords_medrxiv": [],
-      "custom_keywords_chemrxiv": [
-        "molecules",
-        "carbon"
-      ],
-      "custom_keywords_ssrn": [
-        "llm"
-      ]
+      "custom_keywords_chemrxiv": [],
+      "custom_keywords_ssrn": [],
+      "custom_keywords_ieee": []
     },
     "914436997": {
       "welcome_shown_at": "2026-03-25T15:17:34+00:00",
