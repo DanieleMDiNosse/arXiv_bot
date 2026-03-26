@@ -26,14 +26,18 @@
         "pubmed:41840968",
         "pubmed:41840485"
       ],
-      "custom_keywords_arxiv": [],
+      "custom_keywords_arxiv": [
+        "quantum"
+      ],
       "custom_keywords_biorxiv": [
         "cellular",
         "cancer"
       ],
       "custom_keywords_medrxiv": [],
       "custom_keywords_chemrxiv": [],
-      "custom_keywords_ssrn": [],
+      "custom_keywords_ssrn": [
+        "risk"
+      ],
       "custom_keywords_ieee": []
     },
     "914436997": {
