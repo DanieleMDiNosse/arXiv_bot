@@ -21,8 +21,12 @@
     },
     "140139665": {
       "welcome_shown_at": "2026-03-25T15:16:34+00:00",
-      "custom_keywords_arxiv": [
-        "llm"
+      "custom_keywords_pubmed": [
+        "anesthesia + liver"
+      ],
+      "bookmarks": [
+        "pubmed:41840968",
+        "pubmed:41840485"
       ]
     },
     "914436997": {
@@ -52,7 +56,16 @@
       "bookmarks": [
         "arxiv:2603.24137v1"
       ]
+    },
+    "177754649": {
+      "welcome_shown_at": "2026-03-26T09:39:33+00:00",
+      "custom_keywords_pubmed": [
+        "Liver",
+        "Liver + transplant",
+        "Anesthesia + liver"
+      ]
     }
   },
-  "hours_back": 24
+  "hours_back": 24,
+  "report_forward_chat_id": 6737424044
 }

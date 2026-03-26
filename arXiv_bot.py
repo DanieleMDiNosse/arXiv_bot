@@ -52,14 +52,31 @@ PUBMED_FUTURE_GRACE_DAYS = int(os.getenv("PUBMED_FUTURE_GRACE_DAYS", "2"))
 RECAP_TIMEZONE_PAGE_SIZE = max(1, int(os.getenv("RECAP_TIMEZONE_PAGE_SIZE", "8")))
 COFFEE_URL = os.getenv("COFFEE_URL", "").strip()
 COFFEE_TEXT = os.getenv("COFFEE_TEXT", "Support this bot").strip() or "Support this bot"
+COFFEE_EVM_ADDRESS = os.getenv(
+    "COFFEE_EVM_ADDRESS",
+    "0x566dbD781299dC574e886e8c6072C72eFA01204a",
+).strip()
+COFFEE_SOLANA_ADDRESS = os.getenv(
+    "COFFEE_SOLANA_ADDRESS",
+    "BKNb6zJNiL1qpqmZtr9nWsNN2SKq5FHtLtwgoytLpH4e",
+).strip()
+COFFEE_BTC_ADDRESS = os.getenv(
+    "COFFEE_BTC_ADDRESS",
+    "bc1qmjk0d9msq40vephdfjd9sz3x4acng0fd6x4jyc",
+).strip()
+REPORT_TEXT = os.getenv(
+    "REPORT_TEXT",
+    "Report malfunctions or send feature requests",
+).strip() or "Report malfunctions or send feature requests"
+REPORT_FORWARD_CHAT_ID = os.getenv("REPORT_FORWARD_CHAT_ID", "").strip()
 SETTINGS_FILE = Path("bot_settings.json")
 MENU_BTN_TODAY = "Last 24h"
 MENU_BTN_KEYWORDS = "Keywords"
-MENU_BTN_ADD_ARXIV_KEYWORD = "➕ arXiv keywords"
-MENU_BTN_REMOVE_ARXIV_KEYWORD = "➖ arXiv keywords"
+MENU_BTN_ADD_ARXIV_KEYWORD = "Add arXiv keywords"
+MENU_BTN_REMOVE_ARXIV_KEYWORD = "Remove arXiv keywords"
 MENU_BTN_CLEAR_ARXIV_KEYWORD = "🧹 arXiv keywords"
-MENU_BTN_ADD_PUBMED_KEYWORD = "➕ PubMed keywords"
-MENU_BTN_REMOVE_PUBMED_KEYWORD = "➖ PubMed keywords"
+MENU_BTN_ADD_PUBMED_KEYWORD = "Add PubMed keywords"
+MENU_BTN_REMOVE_PUBMED_KEYWORD = "Remove PubMed keywords"
 MENU_BTN_CLEAR_PUBMED_KEYWORD = "🧹 PubMed keywords"
 MENU_BTN_SEARCH_HOURS = "Search Hours"
 MENU_BTN_DAILY_RECAP = "Recap On/Off"
@@ -67,6 +84,7 @@ MENU_BTN_SET_RECAP_TIME = "Recap Time"
 MENU_BTN_RECAP_STATUS = "Recap Status"
 MENU_BTN_BOOKMARKS = "Bookmarks"
 MENU_BTN_HELP = "Help"
+MENU_BTN_REPORT = "Report issue"
 MENU_BTN_COFFEE = "Pay me a coffee"
 SOURCE_ARXIV = "arxiv"
 SOURCE_PUBMED = "pubmed"
@@ -90,9 +108,9 @@ def build_main_menu_markup() -> ReplyKeyboardMarkup:
                 MENU_BTN_REMOVE_PUBMED_KEYWORD,
                 MENU_BTN_CLEAR_PUBMED_KEYWORD,
             ],
-            [MENU_BTN_DAILY_RECAP],
-            [MENU_BTN_SET_RECAP_TIME, MENU_BTN_RECAP_STATUS],
-            [MENU_BTN_HELP, MENU_BTN_COFFEE],
+            [MENU_BTN_DAILY_RECAP, MENU_BTN_SET_RECAP_TIME, MENU_BTN_RECAP_STATUS],
+            [MENU_BTN_HELP],
+            [MENU_BTN_REPORT, MENU_BTN_COFFEE],
         ],
         resize_keyboard=True,
     )
@@ -106,6 +124,27 @@ def build_coffee_markup() -> Optional[InlineKeyboardMarkup]:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(text="Open support link", url=COFFEE_URL)]]
     )
+
+
+def get_report_forward_chat_id() -> Optional[int]:
+    if REPORT_FORWARD_CHAT_ID:
+        try:
+            return int(REPORT_FORWARD_CHAT_ID)
+        except ValueError:
+            logger.warning("Invalid REPORT_FORWARD_CHAT_ID: %r", REPORT_FORWARD_CHAT_ID)
+
+    settings = load_settings()
+    raw_value = settings.get("report_forward_chat_id")
+    try:
+        return int(raw_value) if raw_value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def set_report_forward_chat_id(chat_id: int) -> None:
+    settings = load_settings()
+    settings["report_forward_chat_id"] = int(chat_id)
+    save_settings(settings)
 
 
 def build_recap_timezone_regions_markup() -> InlineKeyboardMarkup:
@@ -829,6 +868,9 @@ def parse_keywords_input(raw: str) -> List[str]:
     cleaned: List[str] = []
     for item in items:
         item = item.strip().strip('"').strip("'").strip()
+        # Keep '+' as logical AND operator but normalize spacing so duplicate
+        # detection is stable across inputs like "a+b" and "a + b".
+        item = re.sub(r"\s*\+\s*", " + ", item).strip()
         if item:
             cleaned.append(item)
 
@@ -1906,15 +1948,11 @@ async def send_daily_recap_for_user(
 
     now_label = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     if not papers:
-        arxiv_raw = raw_breakdown.get("arxiv", 0)
-        pubmed_raw = raw_breakdown.get("pubmed", 0)
         await application.bot.send_message(
             chat_id=chat_id,
             text=(
                 f"Daily recap • {now_label}\n"
-                f"No matching papers in the last {DAILY_RECAP_HOURS} hours.\n"
-                f"Raw entries: {raw_count} "
-                f"(arXiv: {arxiv_raw}, PubMed: {pubmed_raw})"
+                f"No matching papers in the last {DAILY_RECAP_HOURS} hours."
             ),
             reply_markup=build_main_menu_markup(),
         )
@@ -2000,16 +2038,20 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_first_open:
         welcome_text = (
             "<b>Welcome to dailyArXiv</b>\n\n"
-            "Track new papers from arXiv and PubMed with your own keywords.\n\n"
-            "<b>Quick Start</b>\n"
+            "Track new papers from arXiv and PubMed using your own keywords.\n\n"
+            "<b>Initial Setup (do this first)</b>\n"
             f"1. Add keywords with <b>{html.escape(MENU_BTN_ADD_ARXIV_KEYWORD)}</b> and "
             f"<b>{html.escape(MENU_BTN_ADD_PUBMED_KEYWORD)}</b>\n"
-            f"2. Tap <b>{html.escape(MENU_BTN_TODAY)}</b> for the last {TODAY_HOURS_BACK} hours on arXiv and PubMed\n"
-            f"3. Tap <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a different time range\n"
-            f"4. Use <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b> and "
-            f"<b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b> for automatic updates at one or more local times\n\n"
-            "<b>Tip</b>\nUse commas for OR and <code>+</code> for AND inside one clause.\n"
-            'e.g. <code>"quantum mechanics" + entanglement, superconductivity</code>.'
+            f"2. Check results with <b>{html.escape(MENU_BTN_TODAY)}</b> "
+            f"(last {TODAY_HOURS_BACK}h) or <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b>\n\n"
+            "<b>Set Up Recap</b>\n"
+            f"3. Turn recap on with <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b>\n"
+            f"4. Set one or more recap times with <b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>\n"
+            f"5. Confirm recap status with <b>{html.escape(MENU_BTN_RECAP_STATUS)}</b>\n\n"
+            "<b>Keyword Syntax</b>\n"
+            "Use commas for separate alternatives (OR).\n"
+            "Use <code>+</code> to search terms together (AND) in one keyword entry.\n"
+            'Example: <code>"quantum mechanics" + entanglement, superconductivity</code>.'
         )
         await update.message.reply_text(
             welcome_text,
@@ -2035,12 +2077,19 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def build_help_text() -> str:
     return (
-        "<b>Buttons</b>\n"
+        "<b>Initial Setup</b>\n"
+        f"1. Add your first keywords with <b>{html.escape(MENU_BTN_ADD_ARXIV_KEYWORD)}</b> and "
+        f"<b>{html.escape(MENU_BTN_ADD_PUBMED_KEYWORD)}</b>\n"
+        f"2. Run your first search with <b>{html.escape(MENU_BTN_TODAY)}</b> or "
+        f"<b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b>\n"
+        f"3. Configure automatic updates with <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b> and "
+        f"<b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>\n\n"
+        "<b>Search & Results</b>\n"
         f"• <b>{html.escape(MENU_BTN_TODAY)}</b>: show the last {TODAY_HOURS_BACK} hours on arXiv and PubMed\n"
         f"• <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b>: choose a custom time range\n"
         f"• <b>{html.escape(MENU_BTN_KEYWORDS)}</b>: show your current keyword lists\n"
         f"• <b>{html.escape(MENU_BTN_BOOKMARKS)}</b>: show saved papers\n\n"
-        "<b>Keyword Buttons</b>\n"
+        "<b>Keyword Management</b>\n"
         f"• <b>{html.escape(MENU_BTN_ADD_ARXIV_KEYWORD)}</b>: add arXiv keywords\n"
         f"• <b>{html.escape(MENU_BTN_REMOVE_ARXIV_KEYWORD)}</b>: remove arXiv keywords\n"
         f"• <b>{html.escape(MENU_BTN_CLEAR_ARXIV_KEYWORD)}</b>: clear all arXiv keywords\n"
@@ -2048,14 +2097,17 @@ def build_help_text() -> str:
         f"• <b>{html.escape(MENU_BTN_REMOVE_PUBMED_KEYWORD)}</b>: remove PubMed keywords\n"
         f"• <b>{html.escape(MENU_BTN_CLEAR_PUBMED_KEYWORD)}</b>: clear all PubMed keywords\n\n"
         "<b>Recap</b>\n"
-        f"• <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b>: turn the daily recap on or off\n"
-        f"• <b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>: choose a time zone and set one or more local recap times (HH:MM)\n"
+        f"• <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b>: turn the recap on or off\n"
+        f"• <b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>: choose time zone and set one or more local recap times (HH:MM)\n"
         f"• <b>{html.escape(MENU_BTN_RECAP_STATUS)}</b>: show recap status and times\n\n"
+        "<b>Keyword Syntax</b>\n"
+        "• Commas = separate alternatives (OR)\n"
+        "• <code>+</code> = terms searched together (AND) in one entry\n"
+        '• Example: <code>"quantum mechanics" + entanglement, superconductivity</code>\n\n'
         "<b>Other</b>\n"
         f"• <b>{html.escape(MENU_BTN_HELP)}</b>: show this guide\n"
-        f"• <b>{html.escape(MENU_BTN_COFFEE)}</b>: open support link\n\n"
-        "<b>Tip</b>\nUse commas for OR and <code>+</code> for AND inside one clause.\n"
-        'e.g. <code>"quantum mechanics" + entanglement, superconductivity</code>.'
+        f"• <b>{html.escape(MENU_BTN_REPORT)}</b>: report bugs or send feature requests\n"
+        f"• <b>{html.escape(MENU_BTN_COFFEE)}</b>: open support link"
     )
 
 
@@ -2064,17 +2116,141 @@ async def coffee_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     markup = build_coffee_markup()
-    if markup is None:
+    if not COFFEE_EVM_ADDRESS and not COFFEE_SOLANA_ADDRESS and not COFFEE_BTC_ADDRESS:
+        if markup is None:
+            await update.message.reply_text(
+                "No support destination is configured yet.",
+                reply_markup=build_main_menu_markup(),
+            )
+            return
         await update.message.reply_text(
-            "The support link is not configured yet.",
+            COFFEE_TEXT,
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+        return
+
+    address_lines: List[str] = []
+    if COFFEE_EVM_ADDRESS:
+        address_lines.append("<b>EVM (Ethereum/Base/Arbitrum/OP/Polygon/BNB/Hyperliquid)</b>")
+        address_lines.append(f"<code>{html.escape(COFFEE_EVM_ADDRESS)}</code>")
+    if COFFEE_SOLANA_ADDRESS:
+        if address_lines:
+            address_lines.append("")
+        address_lines.append("<b>Solana</b>")
+        address_lines.append(f"<code>{html.escape(COFFEE_SOLANA_ADDRESS)}</code>")
+    if COFFEE_BTC_ADDRESS:
+        if address_lines:
+            address_lines.append("")
+        address_lines.append("<b>Bitcoin</b>")
+        address_lines.append(f"<code>{html.escape(COFFEE_BTC_ADDRESS)}</code>")
+
+    message = (
+        "<b>Support this bot</b>\n\n"
+        "You can send support using one of these networks:\n\n"
+        + "\n".join(address_lines)
+        + "\n\n"
+        "Please double-check the address before sending."
+    )
+    await update.message.reply_text(
+        message,
+        reply_markup=markup if markup is not None else build_main_menu_markup(),
+        disable_web_page_preview=True,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    if get_report_forward_chat_id() is None:
+        await update.message.reply_text(
+            "Report inbox is not configured yet on this bot.",
             reply_markup=build_main_menu_markup(),
         )
         return
 
+    _clear_pending_input_flags(context)
+    context.user_data["awaiting_report_input"] = True
     await update.message.reply_text(
-        COFFEE_TEXT,
-        reply_markup=markup,
-        disable_web_page_preview=True,
+        "<b>Report Issue / Request</b>\n\n"
+        "Write your message and send it here.\n"
+        "Your message will be forwarded to the maintainer.\n\n"
+        "To cancel, press any other menu button.",
+        reply_markup=build_main_menu_markup(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def apply_report_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw: str,
+) -> bool:
+    message = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+    if message is None or user is None or chat is None:
+        return False
+
+    report_text = (raw or "").strip()
+    if not report_text:
+        await message.reply_text(
+            "Empty message. Please write a short description.",
+            reply_markup=build_main_menu_markup(),
+        )
+        return False
+
+    target_chat_id = get_report_forward_chat_id()
+    if target_chat_id is None:
+        await message.reply_text(
+            "Report inbox is not configured yet on this bot.",
+            reply_markup=build_main_menu_markup(),
+        )
+        return False
+
+    username = f"@{user.username}" if user.username else "(no username)"
+    forwarded_text = (
+        "<b>New report/request</b>\n"
+        f"<b>From</b>: {html.escape(user.full_name)} ({html.escape(username)})\n"
+        f"<b>User ID</b>: <code>{user.id}</code>\n"
+        f"<b>Chat ID</b>: <code>{chat.id}</code>\n\n"
+        "<b>Message</b>\n"
+        f"{html.escape(report_text)}"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=forwarded_text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception("Could not forward report message")
+        await message.reply_text(
+            "Could not forward your message right now. Please try again later.",
+            reply_markup=build_main_menu_markup(),
+        )
+        return False
+
+    await message.reply_text(
+        "Message sent. Thank you for the report.",
+        reply_markup=build_main_menu_markup(),
+    )
+    return True
+
+
+async def setreporttarget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if update.message is None or chat is None:
+        return
+
+    set_report_forward_chat_id(int(chat.id))
+    await update.message.reply_text(
+        f"Report target set to chat ID <code>{chat.id}</code>.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_main_menu_markup(),
     )
 
 
@@ -2111,7 +2287,7 @@ async def keywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "<b>PubMed</b>\n"
             f"<pre>{pubmed_body}</pre>\n\n"
             f"Use <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a different time range.\n"
-            "Use commas for OR and <code>+</code> for AND inside one clause.\n"
+            "Use commas for separate alternatives (OR). Use <code>+</code> to search terms together (AND) in one entry.\n"
             'e.g. <code>"quantum mechanics" + entanglement, superconductivity</code>.',
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
@@ -2126,6 +2302,7 @@ def _clear_pending_input_flags(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_hours_input", None)
     context.user_data.pop("awaiting_recap_timezone_input", None)
     context.user_data.pop("awaiting_recap_time_input", None)
+    context.user_data.pop("awaiting_report_input", None)
     context.user_data.pop("pending_recap_timezone", None)
 
 
@@ -2136,7 +2313,7 @@ async def prompt_setkeywords_input(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(
             "<b>Set Keywords</b>\n\n"
             "Send a comma-separated list for both sources.\n"
-            "Use <code>+</code> inside one entry to require all terms.\n\n"
+            "Use <code>+</code> inside one entry to search terms together (AND), not separately.\n\n"
             "<b>Example</b>\n"
             "<code>astronomy, climate change + photosynthesis</code>\n\n"
             "To edit one source only, use the source-specific buttons.",
@@ -2158,6 +2335,7 @@ async def prompt_add_keyword_for_source(
             f"<b>Add Keywords • {html.escape(source_label)}</b>\n\n"
             "Send one or more keywords.\n"
             "Separate entries with commas.\n\n"
+            "Use <code>+</code> inside one entry to search terms together (AND), not separately.\n\n"
             "<b>Examples</b>\n"
             "<code>quantum mechanics</code>\n"
             "<code>astronomy, climate change + photosynthesis</code>\n"
@@ -2464,10 +2642,20 @@ async def apply_keywords_input_for_source(
     if not changed:
         if update.message:
             if mode == "add":
-                await update.message.reply_text(
-                    f"No new keywords to add in {source_label}.",
-                    reply_markup=build_main_menu_markup(),
-                )
+                if skipped:
+                    skipped_block = "\n".join(f"• {html.escape(item)}" for item in skipped)
+                    await update.message.reply_text(
+                        f"<b>No new keywords added in {html.escape(source_label)}</b>\n\n"
+                        "<b>Already present</b>\n"
+                        f"{skipped_block}",
+                        reply_markup=build_main_menu_markup(),
+                        parse_mode=ParseMode.HTML,
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"No new keywords to add in {source_label}.",
+                        reply_markup=build_main_menu_markup(),
+                    )
             else:
                 details = ""
                 if missing:
@@ -2665,7 +2853,7 @@ async def setkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     "Use this format:\n"
                     "arxiv kw1, kw2 + kw3\n"
                     "pubmed kw1, kw2 + kw3\n\n"
-                    "Use commas for OR and + for AND inside one clause.\n\n"
+                    "Use commas for separate alternatives (OR). Use + to search terms together (AND) in one entry.\n\n"
                     f"You can also use {MENU_BTN_ADD_ARXIV_KEYWORD} or {MENU_BTN_ADD_PUBMED_KEYWORD}.",
                     reply_markup=build_main_menu_markup(),
                 )
@@ -2758,7 +2946,7 @@ async def addkeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "arxiv quantum mechanics\n"
                 "arxiv astronomy, climate change + photosynthesis\n"
                 "pubmed genetics\n\n"
-                "Use commas for OR and + for AND inside one clause.\n\n"
+                "Use commas for separate alternatives (OR). Use + to search terms together (AND) in one entry.\n\n"
                 f"Or use {MENU_BTN_ADD_ARXIV_KEYWORD} / {MENU_BTN_ADD_PUBMED_KEYWORD}.",
                 reply_markup=build_main_menu_markup(),
             )
@@ -3370,6 +3558,7 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         MENU_BTN_RECAP_STATUS.casefold(): dailyrecap_status_cmd,
         MENU_BTN_BOOKMARKS.casefold(): bookmarks_cmd,
         MENU_BTN_HELP.casefold(): help_cmd,
+        MENU_BTN_REPORT.casefold(): report_cmd,
         MENU_BTN_COFFEE.casefold(): coffee_cmd,
     }
 
@@ -3381,6 +3570,7 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "awaiting_hours_input",
         "awaiting_recap_timezone_input",
         "awaiting_recap_time_input",
+        "awaiting_report_input",
     ]
     has_pending_action = any(context.user_data.get(flag, False) for flag in pending_flags)
 
@@ -3439,6 +3629,11 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if context.user_data.get("awaiting_recap_time_input", False):
         await apply_recap_time_input(update, context, text)
+        return
+
+    if context.user_data.get("awaiting_report_input", False):
+        await apply_report_input(update, context, text)
+        context.user_data.pop("awaiting_report_input", None)
         return
 
     await message.reply_text(
@@ -3547,10 +3742,6 @@ async def run_search_for_hours(
             return False
 
     if not papers:
-        raw_count = context.user_data.get("last_raw_entry_count", 0)
-        raw_breakdown = context.user_data.get("last_raw_entry_breakdown", {})
-        arxiv_raw = int(raw_breakdown.get("arxiv", 0) or 0) if isinstance(raw_breakdown, dict) else 0
-        pubmed_raw = int(raw_breakdown.get("pubmed", 0) or 0) if isinstance(raw_breakdown, dict) else 0
         query = context.user_data.get("last_query", "")
 
         if not query:
@@ -3562,8 +3753,7 @@ async def run_search_for_hours(
         else:
             text = (
                 f"No matching papers found in {_describe_search_window(effective_scope, hours_back)}.\n"
-                f"Raw entries: {raw_count} "
-                f"(arXiv: {arxiv_raw}, PubMed: {pubmed_raw})\n\n"
+                "\n"
                 f"Review your keywords in {MENU_BTN_KEYWORDS} and try again."
             )
 
@@ -3836,6 +4026,8 @@ def main() -> None:
     app.add_handler(CommandHandler("searchhours", searchhours_cmd))
     app.add_handler(CommandHandler("sethours", sethours_cmd))
     app.add_handler(CommandHandler("bookmarks", bookmarks_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("setreporttarget", setreporttarget_cmd))
     app.add_handler(CommandHandler("coffee", coffee_cmd))
     app.add_handler(CommandHandler("dailyrecap", dailyrecap_cmd))
     app.add_handler(CommandHandler("setrecaptime", setrecaptime_cmd))
