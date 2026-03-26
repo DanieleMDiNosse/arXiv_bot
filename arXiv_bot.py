@@ -73,6 +73,7 @@ REPORT_TEXT = os.getenv(
     "Report malfunctions or send feature requests",
 ).strip() or "Report malfunctions or send feature requests"
 REPORT_FORWARD_CHAT_ID = os.getenv("REPORT_FORWARD_CHAT_ID", "").strip()
+REPORT_ADMIN_USER_ID = os.getenv("REPORT_ADMIN_USER_ID", "").strip()
 SETTINGS_FILE = Path("bot_settings.json")
 MENU_BTN_TODAY = "Last 24h"
 MENU_BTN_KEYWORDS = "Keywords"
@@ -171,24 +172,61 @@ def build_coffee_markup() -> Optional[InlineKeyboardMarkup]:
     )
 
 
-def get_report_forward_chat_id() -> Optional[int]:
-    if REPORT_FORWARD_CHAT_ID:
-        try:
-            return int(REPORT_FORWARD_CHAT_ID)
-        except ValueError:
-            logger.warning("Invalid REPORT_FORWARD_CHAT_ID: %r", REPORT_FORWARD_CHAT_ID)
+def _parse_report_chat_ids(raw_value: Any, *, source_name: str) -> List[int]:
+    if raw_value is None:
+        return []
+    tokens: List[str]
+    if isinstance(raw_value, Sequence) and not isinstance(raw_value, (str, bytes, bytearray)):
+        tokens = [str(item).strip() for item in raw_value]
+    else:
+        text = str(raw_value).strip()
+        if not text:
+            return []
+        tokens = [part.strip() for part in re.split(r"[,\s;]+", text) if part.strip()]
 
-    settings = load_settings()
-    raw_value = settings.get("report_forward_chat_id")
+    parsed: List[int] = []
+    seen: set[int] = set()
+    for token in tokens:
+        try:
+            chat_id = int(token)
+        except (TypeError, ValueError):
+            logger.warning("Invalid %s value ignored: %r", source_name, token)
+            continue
+        if chat_id in seen:
+            continue
+        seen.add(chat_id)
+        parsed.append(chat_id)
+    return parsed
+
+
+def get_report_forward_chat_ids() -> List[int]:
+    return _parse_report_chat_ids(
+        REPORT_FORWARD_CHAT_ID,
+        source_name="REPORT_FORWARD_CHAT_ID",
+    )
+
+
+def get_report_forward_chat_id() -> Optional[int]:
+    chat_ids = get_report_forward_chat_ids()
+    return chat_ids[0] if chat_ids else None
+
+
+def get_report_admin_user_id() -> Optional[int]:
+    raw_value = REPORT_ADMIN_USER_ID
+    if not raw_value:
+        return None
     try:
-        return int(raw_value) if raw_value is not None else None
-    except (TypeError, ValueError):
+        return int(raw_value)
+    except ValueError:
+        logger.warning("Invalid REPORT_ADMIN_USER_ID: %r", REPORT_ADMIN_USER_ID)
         return None
 
 
 def set_report_forward_chat_id(chat_id: int) -> None:
     settings = load_settings()
-    settings["report_forward_chat_id"] = int(chat_id)
+    normalized = int(chat_id)
+    settings["report_forward_chat_id"] = normalized
+    settings["report_forward_chat_ids"] = [normalized]
     save_settings(settings)
 
 
@@ -3078,7 +3116,7 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if update.message is None:
         return
 
-    if get_report_forward_chat_id() is None:
+    if not get_report_forward_chat_ids():
         await update.message.reply_text(
             "Report inbox is not configured yet on this bot.",
             reply_markup=build_main_menu_markup(),
@@ -3116,8 +3154,8 @@ async def apply_report_input(
         )
         return False
 
-    target_chat_id = get_report_forward_chat_id()
-    if target_chat_id is None:
+    target_chat_ids = get_report_forward_chat_ids()
+    if not target_chat_ids:
         await message.reply_text(
             "Report inbox is not configured yet on this bot.",
             reply_markup=build_main_menu_markup(),
@@ -3134,14 +3172,19 @@ async def apply_report_input(
         f"{html.escape(report_text)}"
     )
 
-    try:
-        await context.bot.send_message(
-            chat_id=target_chat_id,
-            text=forwarded_text,
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        logger.exception("Could not forward report message")
+    sent_count = 0
+    for target_chat_id in target_chat_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=target_chat_id,
+                text=forwarded_text,
+                parse_mode=ParseMode.HTML,
+            )
+            sent_count += 1
+        except Exception:
+            logger.exception("Could not forward report message to %s", target_chat_id)
+
+    if sent_count == 0:
         await message.reply_text(
             "Could not forward your message right now. Please try again later.",
             reply_markup=build_main_menu_markup(),
@@ -3157,12 +3200,22 @@ async def apply_report_input(
 
 async def setreporttarget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
-    if update.message is None or chat is None:
+    user = update.effective_user
+    if update.message is None or chat is None or user is None:
         return
 
-    set_report_forward_chat_id(int(chat.id))
+    admin_user_id = get_report_admin_user_id()
+    if admin_user_id is None or int(user.id) != admin_user_id:
+        await update.message.reply_text(
+            "This command is not available to users.\n"
+            "Configure REPORT_FORWARD_CHAT_ID on the server.",
+            reply_markup=build_main_menu_markup(),
+        )
+        return
+
     await update.message.reply_text(
-        f"Report target set to chat ID <code>{chat.id}</code>.",
+        "Report target is configured from environment only.\n"
+        "Set REPORT_FORWARD_CHAT_ID on the server.",
         parse_mode=ParseMode.HTML,
         reply_markup=build_main_menu_markup(),
     )
