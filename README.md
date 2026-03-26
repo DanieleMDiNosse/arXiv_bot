@@ -2,8 +2,6 @@
 
 `Scholar Stream` is a Telegram bot for researchers who want a lightweight way to monitor fresh papers across multiple academic sources without building a full alerting pipeline.
 
-> Track fresh papers across preprint servers, journals, and indexes directly from Telegram.
-
 It tracks new results from **arXiv**, **bioRxiv**, **medRxiv**, **ChemRxiv**, **SSRN**, **IEEE**, and **PubMed**, using keyword lists defined by each user. Results are delivered in Telegram with compact metadata, expandable abstracts, direct paper links, PDF download buttons when available, bookmarks, and scheduled recaps.
 
 ## Supported sources
