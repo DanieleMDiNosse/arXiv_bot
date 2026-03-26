@@ -43,6 +43,7 @@ PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 DEFAULT_MAX_RESULTS = int(os.getenv("MAX_RESULTS", "300"))
 TODAY_HOURS_BACK = 24
 DAILY_RECAP_HOURS = 24
+RESULTS_PAGE_SIZE = max(1, int(os.getenv("RESULTS_PAGE_SIZE", "10")))
 DEFAULT_DAILY_RECAP_TIME = "09:00"
 DEFAULT_DAILY_RECAP_TIMEZONE = "UTC"
 MAX_DAILY_RECAP_ITEMS = int(os.getenv("DAILY_RECAP_MAX_ITEMS", "20"))
@@ -52,7 +53,7 @@ RECAP_TIMEZONE_PAGE_SIZE = max(1, int(os.getenv("RECAP_TIMEZONE_PAGE_SIZE", "8")
 COFFEE_URL = os.getenv("COFFEE_URL", "").strip()
 COFFEE_TEXT = os.getenv("COFFEE_TEXT", "Support this bot").strip() or "Support this bot"
 SETTINGS_FILE = Path("bot_settings.json")
-MENU_BTN_TODAY = "Today"
+MENU_BTN_TODAY = "Last 24h"
 MENU_BTN_KEYWORDS = "Keywords"
 MENU_BTN_ADD_ARXIV_KEYWORD = "➕ arXiv keywords"
 MENU_BTN_REMOVE_ARXIV_KEYWORD = "➖ arXiv keywords"
@@ -72,9 +73,6 @@ SOURCE_PUBMED = "pubmed"
 WELCOME_SHOWN_AT_KEY = "welcome_shown_at"
 SEARCH_SCOPE_TODAY = "today"
 SEARCH_SCOPE_HOURS = "hours"
-ARXIV_ANNOUNCEMENT_TZ = ZoneInfo("America/New_York")
-ARXIV_ANNOUNCEMENT_HOUR = 20
-ARXIV_ANNOUNCEMENT_WEEKDAYS = {0, 1, 2, 3, 6}
 
 
 def build_main_menu_markup() -> ReplyKeyboardMarkup:
@@ -875,97 +873,8 @@ def _normalize_search_scope(scope: Any) -> str:
 
 def _describe_search_window(scope: str, hours_back: int) -> str:
     if _normalize_search_scope(scope) == SEARCH_SCOPE_TODAY:
-        return "the latest arXiv announcement batch and the last 24 hours on PubMed"
+        return f"the last {TODAY_HOURS_BACK} hours"
     return f"the last {int(hours_back)} hours"
-
-
-def _latest_arxiv_announcement_time(now_utc: Optional[datetime] = None) -> datetime:
-    """Return the latest scheduled arXiv announcement time in UTC.
-
-    Parameters
-    ----------
-    now_utc : datetime, optional
-        Reference timestamp in UTC. If omitted, the current UTC time is used.
-
-    Returns
-    -------
-    datetime
-        UTC timestamp for the latest scheduled arXiv announcement batch.
-
-    Notes
-    -----
-    arXiv publishes announcement batches at 20:00 Eastern US on Sunday
-    through Thursday. Friday and Saturday have no scheduled announcements.
-    This follows arXiv's regular published schedule and does not model ad hoc
-    holiday deferrals.
-
-    Examples
-    --------
-    >>> isinstance(_latest_arxiv_announcement_time(), datetime)
-    True
-    """
-    reference_utc = ensure_utc(now_utc or datetime.now(timezone.utc))
-    reference_et = reference_utc.astimezone(ARXIV_ANNOUNCEMENT_TZ)
-
-    candidate_date = reference_et.date()
-    candidate_time = datetime.combine(
-        candidate_date,
-        time(hour=ARXIV_ANNOUNCEMENT_HOUR),
-        tzinfo=ARXIV_ANNOUNCEMENT_TZ,
-    )
-    if reference_et < candidate_time:
-        candidate_date -= timedelta(days=1)
-
-    while candidate_date.weekday() not in ARXIV_ANNOUNCEMENT_WEEKDAYS:
-        candidate_date -= timedelta(days=1)
-
-    return datetime.combine(
-        candidate_date,
-        time(hour=ARXIV_ANNOUNCEMENT_HOUR),
-        tzinfo=ARXIV_ANNOUNCEMENT_TZ,
-    ).astimezone(timezone.utc)
-
-
-def _entries_to_latest_arxiv_batch_papers(
-    entries: Sequence[Any],
-    now_utc: Optional[datetime] = None,
-) -> List[Paper]:
-    """Convert arXiv API entries to papers from the latest announcement batch.
-
-    Parameters
-    ----------
-    entries : Sequence[Any]
-        Parsed arXiv API entries for a keyword query.
-    now_utc : datetime, optional
-        Reference timestamp in UTC. If omitted, the current UTC time is used.
-
-    Returns
-    -------
-    List[Paper]
-        Papers whose published timestamp falls in the most recent scheduled
-        arXiv announcement batch.
-
-    Notes
-    -----
-    The Today view should mirror arXiv's batch announcements rather than a
-    rolling 24-hour window, because arXiv does not publish continuously.
-
-    Examples
-    --------
-    >>> _entries_to_latest_arxiv_batch_papers([])
-    []
-    """
-    latest_batch_utc = _latest_arxiv_announcement_time(now_utc)
-    papers: List[Paper] = []
-
-    for entry in entries:
-        paper = entry_to_paper(entry, index=len(papers) + 1)
-        if paper is None:
-            continue
-        if paper.published >= latest_batch_utc:
-            papers.append(paper)
-
-    return papers
 
 
 def build_arxiv_query(keywords: Sequence[str]) -> Optional[str]:
@@ -1305,12 +1214,13 @@ def fetch_recent_pubmed_papers(
 def fetch_arxiv_entries(
     query: str,
     max_results: int = DEFAULT_MAX_RESULTS,
+    sort_by: str = "submittedDate",
 ) -> tuple[list[Any], str]:
     params = {
         "search_query": query,
         "start": 0,
         "max_results": max_results,
-        "sortBy": "submittedDate",
+        "sortBy": sort_by,
         "sortOrder": "descending",
     }
 
@@ -1408,7 +1318,12 @@ def entry_to_paper(entry: Any, index: int) -> Optional[Paper]:
     )
 
 
-def entries_to_recent_papers(entries: Sequence[Any], hours_back: int) -> List[Paper]:
+def entries_to_recent_papers(
+    entries: Sequence[Any],
+    hours_back: int,
+    *,
+    use_updated: bool = False,
+) -> List[Paper]:
     now_utc = datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(hours=hours_back)
 
@@ -1419,12 +1334,24 @@ def entries_to_recent_papers(entries: Sequence[Any], hours_back: int) -> List[Pa
         if paper is None:
             continue
 
-        if paper.published < cutoff:
+        recency = paper.updated if use_updated else paper.published
+        if recency < cutoff:
             break
 
         papers.append(paper)
 
     return papers
+
+
+def _paper_recency_timestamp(
+    paper: Paper,
+    *,
+    prefer_updated_for_arxiv: bool = False,
+) -> datetime:
+    """Return the timestamp used to order paper results in user-facing views."""
+    if prefer_updated_for_arxiv and paper.source.casefold() == SOURCE_ARXIV:
+        return paper.updated
+    return paper.published
 
 
 async def fetch_papers_by_arxiv_ids(arxiv_ids: Sequence[str]) -> tuple[List[Paper], List[str]]:
@@ -1534,13 +1461,20 @@ async def fetch_papers_by_refs(paper_refs: Sequence[str]) -> tuple[List[Paper], 
     return ordered, missing
 
 
-def format_paper_line(paper: Paper) -> str:
+def format_paper_line(
+    paper: Paper,
+    *,
+    prefer_updated_for_arxiv: bool = False,
+) -> str:
     """Format one paper entry for the `/today` list message.
 
     Parameters
     ----------
     paper : Paper
         Paper metadata and abstract text to show in Telegram.
+    prefer_updated_for_arxiv : bool, default=False
+        If True, show the arXiv entry update timestamp instead of the initial
+        publication timestamp. Non-arXiv sources still display `published`.
 
     Returns
     -------
@@ -1582,7 +1516,11 @@ def format_paper_line(paper: Paper) -> str:
     if len(authors) > 240:
         authors = authors[:237].rstrip() + "..."
 
-    published_label = paper.published.strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = _paper_recency_timestamp(
+        paper,
+        prefer_updated_for_arxiv=prefer_updated_for_arxiv,
+    )
+    timestamp_label = timestamp.strftime("%Y-%m-%d %H:%M UTC")
     abstract_html = render_expandable_abstract_html(paper.summary, max_chars=MAX_ABSTRACT_CHARS)
     source_label = paper_source_label(paper.source)
     category_text = normalize_text(paper.primary_category)
@@ -1594,7 +1532,7 @@ def format_paper_line(paper: Paper) -> str:
     ]
     if category_text:
         meta_parts.append(html.escape(category_text))
-    meta_parts.append(html.escape(published_label))
+    meta_parts.append(html.escape(timestamp_label))
 
     message = (
         f"<b>{paper.index}.</b> {html.escape(title_text)}\n"
@@ -1813,12 +1751,15 @@ async def refresh_cache(
             fetch_arxiv_entries,
             arxiv_query,
             DEFAULT_MAX_RESULTS,
+            "lastUpdatedDate" if effective_scope == SEARCH_SCOPE_TODAY else "submittedDate",
         )
         arxiv_raw_count = len(entries)
         if effective_scope == SEARCH_SCOPE_TODAY:
-            # Today mirrors arXiv's scheduled announcement batches, not a
-            # rolling 24-hour window.
-            arxiv_papers = _entries_to_latest_arxiv_batch_papers(entries)
+            arxiv_papers = entries_to_recent_papers(
+                entries,
+                TODAY_HOURS_BACK,
+                use_updated=True,
+            )
         else:
             arxiv_papers = entries_to_recent_papers(entries, effective_hours_back)
 
@@ -1834,7 +1775,13 @@ async def refresh_cache(
         )
 
     papers = arxiv_papers + pubmed_papers
-    papers.sort(key=lambda paper: paper.published, reverse=True)
+    papers.sort(
+        key=lambda paper: _paper_recency_timestamp(
+            paper,
+            prefer_updated_for_arxiv=effective_scope == SEARCH_SCOPE_TODAY,
+        ),
+        reverse=True,
+    )
     for idx, paper in enumerate(papers, start=1):
         paper.index = idx
 
@@ -1864,6 +1811,7 @@ async def refresh_cache(
     user_data["last_raw_entry_breakdown"] = raw_breakdown
     user_data["cache_hours_back"] = effective_hours_back
     user_data["cache_scope"] = effective_scope
+    user_data["results_token"] = int(user_data.get("results_token", 0) or 0) + 1
     return papers
 
 
@@ -1881,9 +1829,14 @@ async def fetch_recent_papers_for_user(
     arxiv_papers: List[Paper] = []
     arxiv_raw = 0
     if arxiv_query:
-        entries, _arxiv_url = await asyncio.to_thread(fetch_arxiv_entries, arxiv_query, DEFAULT_MAX_RESULTS)
+        entries, _arxiv_url = await asyncio.to_thread(
+            fetch_arxiv_entries,
+            arxiv_query,
+            DEFAULT_MAX_RESULTS,
+            "lastUpdatedDate",
+        )
         arxiv_raw = len(entries)
-        arxiv_papers = entries_to_recent_papers(entries, hours_back)
+        arxiv_papers = entries_to_recent_papers(entries, hours_back, use_updated=True)
 
     pubmed_papers: List[Paper] = []
     pubmed_raw = 0
@@ -1896,7 +1849,10 @@ async def fetch_recent_papers_for_user(
         )
 
     papers = arxiv_papers + pubmed_papers
-    papers.sort(key=lambda paper: paper.published, reverse=True)
+    papers.sort(
+        key=lambda paper: _paper_recency_timestamp(paper, prefer_updated_for_arxiv=True),
+        reverse=True,
+    )
     for idx, paper in enumerate(papers, start=1):
         paper.index = idx
 
@@ -1932,7 +1888,7 @@ async def send_daily_recap_for_user(
         logger.exception("Daily recap fetch failed for user %s", user_id)
         await application.bot.send_message(
             chat_id=chat_id,
-            text="Daily recap failed due to a source fetch error.",
+            text="Daily recap failed. Could not fetch papers from one or more sources.",
             reply_markup=build_main_menu_markup(),
         )
         return
@@ -1941,8 +1897,8 @@ async def send_daily_recap_for_user(
         await application.bot.send_message(
             chat_id=chat_id,
             text=(
-                "Daily recap skipped: no active keywords.\n"
-                "Set keywords first using the keyword buttons in the menu."
+                "Daily recap skipped.\n"
+                "Add at least one keyword first."
             ),
             reply_markup=build_main_menu_markup(),
         )
@@ -1955,9 +1911,9 @@ async def send_daily_recap_for_user(
         await application.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"Daily recap ({now_label})\n"
+                f"Daily recap • {now_label}\n"
                 f"No matching papers in the last {DAILY_RECAP_HOURS} hours.\n"
-                f"Raw entries fetched: {raw_count} "
+                f"Raw entries: {raw_count} "
                 f"(arXiv: {arxiv_raw}, PubMed: {pubmed_raw})"
             ),
             reply_markup=build_main_menu_markup(),
@@ -1968,8 +1924,8 @@ async def send_daily_recap_for_user(
     await application.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"Daily recap ({now_label})\n"
-            f"Found {len(papers)} matching paper(s) in the last {DAILY_RECAP_HOURS} hours."
+            f"Daily recap • {now_label}\n"
+            f"{len(papers)} matching paper(s) in the last {DAILY_RECAP_HOURS} hours."
         ),
         reply_markup=build_main_menu_markup(),
     )
@@ -1977,7 +1933,7 @@ async def send_daily_recap_for_user(
     for paper in papers[:shown]:
         await application.bot.send_message(
             chat_id=chat_id,
-            text=format_paper_line(paper),
+            text=format_paper_line(paper, prefer_updated_for_arxiv=True),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=build_paper_reply_markup(paper),
@@ -1987,8 +1943,8 @@ async def send_daily_recap_for_user(
         await application.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"Recap truncated: showing {shown} of {len(papers)} papers. "
-                f"Use {MENU_BTN_TODAY} to see current cached results."
+                f"Showing {shown} of {len(papers)} recap items. "
+                f"Open {MENU_BTN_TODAY} to see the full current list."
             ),
             reply_markup=build_main_menu_markup(),
         )
@@ -2044,15 +2000,15 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_first_open:
         welcome_text = (
             "<b>Welcome to dailyArXiv</b>\n\n"
-            "This bot tracks new papers from arXiv + PubMed based on your keywords.\n\n"
+            "Track new papers from arXiv and PubMed with your own keywords.\n\n"
             "<b>Quick Start</b>\n"
             f"1. Add keywords with <b>{html.escape(MENU_BTN_ADD_ARXIV_KEYWORD)}</b> and "
             f"<b>{html.escape(MENU_BTN_ADD_PUBMED_KEYWORD)}</b>\n"
-            f"2. Tap <b>{html.escape(MENU_BTN_TODAY)}</b> for the latest arXiv batch and the last 24 hours on PubMed\n"
-            f"3. Tap <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a custom time window\n"
+            f"2. Tap <b>{html.escape(MENU_BTN_TODAY)}</b> for the last {TODAY_HOURS_BACK} hours on arXiv and PubMed\n"
+            f"3. Tap <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a different time range\n"
             f"4. Use <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b> and "
             f"<b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b> for automatic updates at one or more local times\n\n"
-            "<b>Tip</b>: use commas for OR and <code>+</code> inside one clause for AND, "
+            "<b>Tip</b>\nUse commas for OR and <code>+</code> for AND inside one clause.\n"
             'e.g. <code>"quantum mechanics" + entanglement, superconductivity</code>.'
         )
         await update.message.reply_text(
@@ -2079,26 +2035,26 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def build_help_text() -> str:
     return (
-        "<b>Menu Actions</b>\n"
-        f"• <b>{html.escape(MENU_BTN_TODAY)}</b>: show the latest arXiv announcement batch plus the last 24 hours on PubMed\n"
-        f"• <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b>: run a custom rolling-hour search window for both sources\n"
-        f"• <b>{html.escape(MENU_BTN_KEYWORDS)}</b>: show active arXiv and PubMed keyword lists\n"
+        "<b>Buttons</b>\n"
+        f"• <b>{html.escape(MENU_BTN_TODAY)}</b>: show the last {TODAY_HOURS_BACK} hours on arXiv and PubMed\n"
+        f"• <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b>: choose a custom time range\n"
+        f"• <b>{html.escape(MENU_BTN_KEYWORDS)}</b>: show your current keyword lists\n"
         f"• <b>{html.escape(MENU_BTN_BOOKMARKS)}</b>: show saved papers\n\n"
-        "<b>Keyword Management</b>\n"
-        f"• <b>{html.escape(MENU_BTN_ADD_ARXIV_KEYWORD)}</b>: add one or more arXiv keywords\n"
-        f"• <b>{html.escape(MENU_BTN_REMOVE_ARXIV_KEYWORD)}</b>: remove one or more arXiv keywords\n"
+        "<b>Keyword Buttons</b>\n"
+        f"• <b>{html.escape(MENU_BTN_ADD_ARXIV_KEYWORD)}</b>: add arXiv keywords\n"
+        f"• <b>{html.escape(MENU_BTN_REMOVE_ARXIV_KEYWORD)}</b>: remove arXiv keywords\n"
         f"• <b>{html.escape(MENU_BTN_CLEAR_ARXIV_KEYWORD)}</b>: clear all arXiv keywords\n"
-        f"• <b>{html.escape(MENU_BTN_ADD_PUBMED_KEYWORD)}</b>: add one or more PubMed keywords\n"
-        f"• <b>{html.escape(MENU_BTN_REMOVE_PUBMED_KEYWORD)}</b>: remove one or more PubMed keywords\n"
+        f"• <b>{html.escape(MENU_BTN_ADD_PUBMED_KEYWORD)}</b>: add PubMed keywords\n"
+        f"• <b>{html.escape(MENU_BTN_REMOVE_PUBMED_KEYWORD)}</b>: remove PubMed keywords\n"
         f"• <b>{html.escape(MENU_BTN_CLEAR_PUBMED_KEYWORD)}</b>: clear all PubMed keywords\n\n"
         "<b>Recap</b>\n"
-        f"• <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b>: toggle daily recap\n"
+        f"• <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b>: turn the daily recap on or off\n"
         f"• <b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>: choose a time zone and set one or more local recap times (HH:MM)\n"
-        f"• <b>{html.escape(MENU_BTN_RECAP_STATUS)}</b>: show recap status and configured times\n\n"
+        f"• <b>{html.escape(MENU_BTN_RECAP_STATUS)}</b>: show recap status and times\n\n"
         "<b>Other</b>\n"
         f"• <b>{html.escape(MENU_BTN_HELP)}</b>: show this guide\n"
         f"• <b>{html.escape(MENU_BTN_COFFEE)}</b>: open support link\n\n"
-        "<b>Tip</b>: use commas for OR and <code>+</code> inside one clause for AND, "
+        "<b>Tip</b>\nUse commas for OR and <code>+</code> for AND inside one clause.\n"
         'e.g. <code>"quantum mechanics" + entanglement, superconductivity</code>.'
     )
 
@@ -2110,7 +2066,7 @@ async def coffee_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     markup = build_coffee_markup()
     if markup is None:
         await update.message.reply_text(
-            "Support link not configured yet. Set COFFEE_URL in your environment.",
+            "The support link is not configured yet.",
             reply_markup=build_main_menu_markup(),
         )
         return
@@ -2147,15 +2103,15 @@ async def keywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.message:
         await update.message.reply_text(
             "<b>Active Keywords</b>\n\n"
-            "<b>Today window</b>\n"
-            "arXiv: latest announcement batch\n"
+            f"<b>{html.escape(MENU_BTN_TODAY)} Window</b>\n"
+            f"arXiv: last {TODAY_HOURS_BACK} hours (by last update)\n"
             f"PubMed: last {TODAY_HOURS_BACK} hours\n\n"
             "<b>arXiv</b>\n"
             f"<pre>{arxiv_body}</pre>\n\n"
             "<b>PubMed</b>\n"
             f"<pre>{pubmed_body}</pre>\n\n"
-            f"Use <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a custom time window.\n"
-            "Tip: use commas for OR and <code>+</code> inside one clause for AND, "
+            f"Use <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a different time range.\n"
+            "Use commas for OR and <code>+</code> for AND inside one clause.\n"
             'e.g. <code>"quantum mechanics" + entanglement, superconductivity</code>.',
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
@@ -2178,12 +2134,12 @@ async def prompt_setkeywords_input(update: Update, context: ContextTypes.DEFAULT
     context.user_data["awaiting_keywords_input"] = True
     if update.message:
         await update.message.reply_text(
-            "<b>Set Keywords (Both Sources)</b>\n\n"
-            "Send keywords as comma-separated values.\n\n"
+            "<b>Set Keywords</b>\n\n"
+            "Send a comma-separated list for both sources.\n"
+            "Use <code>+</code> inside one entry to require all terms.\n\n"
             "<b>Example</b>\n"
             "<code>astronomy, climate change + photosynthesis</code>\n\n"
-            "Use <code>+</code> inside one clause to require all terms.\n\n"
-            "To edit one source only, use the dedicated Add, Remove and Clear buttons.",
+            "To edit one source only, use the source-specific buttons.",
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
         )
@@ -2200,8 +2156,8 @@ async def prompt_add_keyword_for_source(
     if update.message:
         await update.message.reply_text(
             f"<b>Add Keywords • {html.escape(source_label)}</b>\n\n"
-            "Send one or more keywords to add.\n"
-            "Use commas to separate multiple values.\n\n"
+            "Send one or more keywords.\n"
+            "Separate entries with commas.\n\n"
             "<b>Examples</b>\n"
             "<code>quantum mechanics</code>\n"
             "<code>astronomy, climate change + photosynthesis</code>\n"
@@ -2226,9 +2182,9 @@ async def prompt_remove_keyword_for_source(
     if update.message:
         await update.message.reply_text(
             f"<b>Remove Keywords • {html.escape(source_label)}</b>\n\n"
-            "Send one or more keywords to remove.\n"
-            "Use commas to separate multiple values.\n\n"
-            "<b>Current list</b>\n"
+            "Send one or more saved keywords to remove.\n"
+            "Separate entries with commas.\n\n"
+            "<b>Current Keywords</b>\n"
             f"<pre>{body_html}</pre>\n"
             "<b>Examples</b>\n"
             "<code>astronomy</code>\n"
@@ -2268,7 +2224,7 @@ async def prompt_searchhours_input(update: Update, context: ContextTypes.DEFAULT
     if update.message:
         await update.message.reply_text(
             "<b>Search Hours</b>\n\n"
-            "How many hours back do you want to search?\n\n"
+            "Send the number of hours to search.\n\n"
             "<b>Example</b>\n"
             "<code>72</code>",
             reply_markup=build_main_menu_markup(),
@@ -2282,10 +2238,75 @@ def build_open_results_markup(
 ) -> InlineKeyboardMarkup:
     safe_hours = max(1, int(hours_back))
     safe_scope = _normalize_search_scope(scope)
-    button_text = "Open Today results" if safe_scope == SEARCH_SCOPE_TODAY else f"Open results ({safe_hours}h)"
+    button_text = f"Open {MENU_BTN_TODAY} results" if safe_scope == SEARCH_SCOPE_TODAY else f"Open results ({safe_hours}h)"
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(text=button_text, callback_data=f"open_matches:{safe_scope}:{safe_hours}")]]
     )
+
+
+def build_more_results_markup(
+    *,
+    scope: str,
+    hours_back: int,
+    offset: int,
+    results_token: int,
+) -> InlineKeyboardMarkup:
+    """Build the inline keyboard used to request the next page of results."""
+    safe_scope = _normalize_search_scope(scope)
+    safe_hours = max(1, int(hours_back))
+    safe_offset = max(0, int(offset))
+    safe_token = max(0, int(results_token))
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                text="More Results",
+                callback_data=f"more_results:{safe_token}:{safe_scope}:{safe_hours}:{safe_offset}",
+            )
+        ]]
+    )
+
+
+async def send_results_page(
+    send_text: Any,
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    papers: Sequence[Paper],
+    user_id: Optional[int],
+    hours_back: int,
+    scope: str,
+    results_token: int,
+    start_index: int = 0,
+) -> None:
+    """Send one page of cached search results and a `More` button if needed."""
+    safe_start = max(0, int(start_index))
+    safe_scope = _normalize_search_scope(scope)
+    end_index = min(len(papers), safe_start + RESULTS_PAGE_SIZE)
+    bookmarks = set(get_bookmarks(context.user_data, user_id=user_id)) if user_id is not None else set()
+
+    for paper in papers[safe_start:end_index]:
+        await send_text(
+            format_paper_line(
+                paper,
+                prefer_updated_for_arxiv=safe_scope == SEARCH_SCOPE_TODAY,
+            ),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=build_paper_reply_markup(
+                paper,
+                bookmarked=paper_ref_for(paper) in bookmarks,
+            ),
+        )
+
+    if end_index < len(papers):
+        await send_text(
+            f"Showing {safe_start + 1}-{end_index} of {len(papers)} results.",
+            reply_markup=build_more_results_markup(
+                scope=safe_scope,
+                hours_back=hours_back,
+                offset=end_index,
+                results_token=results_token,
+            ),
+        )
 
 
 async def send_open_results_prompt(
@@ -2300,8 +2321,8 @@ async def send_open_results_prompt(
     if update.message is not None:
         await update.message.reply_text(
             (
-                f"<b>Found {papers_count} matching paper(s)</b> in {scope_text}.\n"
-                "Tap the button below to open results now."
+                f"<b>{papers_count} matching paper(s)</b> in {scope_text}.\n"
+                "Tap below to open them."
             ),
             reply_markup=build_open_results_markup(hours_back, scope=scope),
             parse_mode=ParseMode.HTML,
@@ -2311,8 +2332,8 @@ async def send_open_results_prompt(
         await context.bot.send_message(
             chat_id=chat.id,
             text=(
-                f"<b>Found {papers_count} matching paper(s)</b> in {scope_text}.\n"
-                "Tap the button below to open results now."
+                f"<b>{papers_count} matching paper(s)</b> in {scope_text}.\n"
+                "Tap below to open them."
             ),
             reply_markup=build_open_results_markup(hours_back, scope=scope),
             parse_mode=ParseMode.HTML,
@@ -2327,13 +2348,13 @@ async def apply_keywords_input(
     user_id = _get_user_id(update)
     if user_id is None:
         if update.message:
-            await update.message.reply_text("Could not determine which Telegram user sent this command.")
+            await update.message.reply_text("Could not identify your Telegram user.")
         return False
 
     keywords = parse_keywords_input(raw)
     if not keywords:
         if update.message:
-            await update.message.reply_text("No valid keywords found.")
+            await update.message.reply_text("No valid keywords found. Send at least one keyword.")
         return False
 
     # Legacy behavior: /setkeywords without source sets both lists.
@@ -2355,17 +2376,20 @@ async def apply_keywords_input(
     except Exception as exc:
         logger.exception("Failed to refresh after setting keywords")
         if update.message:
-            await update.message.reply_text(f"Keywords updated, but refresh failed:\n{exc}")
+            await update.message.reply_text(f"Keywords were saved, but the results could not be refreshed:\n{exc}")
         return False
 
     if update.message:
+        arxiv_body = "\n".join(f"• {html.escape(item)}" for item in arxiv_keywords) if arxiv_keywords else "(none)"
+        pubmed_body = "\n".join(f"• {html.escape(item)}" for item in pubmed_keywords) if pubmed_keywords else "(none)"
         await update.message.reply_text(
-            "Keywords updated for BOTH sources.\n\n"
-            "arXiv:\n- "
-            + "\n- ".join(arxiv_keywords if arxiv_keywords else ["(none)"])
-            + "\n\nPubMed:\n- "
-            + "\n- ".join(pubmed_keywords if pubmed_keywords else ["(none)"]),
+            "<b>Keywords Updated</b>\n\n"
+            "<b>arXiv</b>\n"
+            f"{arxiv_body}\n\n"
+            "<b>PubMed</b>\n"
+            f"{pubmed_body}",
             reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
         )
     await send_open_results_prompt(
         update=update,
@@ -2387,7 +2411,7 @@ async def apply_keywords_input_for_source(
     user_id = _get_user_id(update)
     if user_id is None:
         if update.message:
-            await update.message.reply_text("Could not determine which Telegram user sent this command.")
+            await update.message.reply_text("Could not identify your Telegram user.")
         return False
 
     source_label = paper_source_label(source)
@@ -2404,7 +2428,7 @@ async def apply_keywords_input_for_source(
         new_keywords = parse_keywords_input(raw)
         if not new_keywords:
             if update.message:
-                await update.message.reply_text("No valid keywords found.")
+                await update.message.reply_text("No valid keywords found. Send at least one keyword.")
             return False
 
         for keyword in new_keywords:
@@ -2420,7 +2444,7 @@ async def apply_keywords_input_for_source(
         remove_keywords = parse_keywords_input(raw)
         if not remove_keywords:
             if update.message:
-                await update.message.reply_text("No valid keywords found.")
+                await update.message.reply_text("No valid keywords found. Send at least one keyword.")
             return False
 
         remove_keys = {keyword.casefold() for keyword in remove_keywords}
@@ -2441,15 +2465,15 @@ async def apply_keywords_input_for_source(
         if update.message:
             if mode == "add":
                 await update.message.reply_text(
-                    f"No new keywords to add for {source_label}.",
+                    f"No new keywords to add in {source_label}.",
                     reply_markup=build_main_menu_markup(),
                 )
             else:
                 details = ""
                 if missing:
-                    details = "\nNot found:\n- " + "\n- ".join(missing)
+                    details = "\n\nNot found:\n- " + "\n- ".join(missing)
                 await update.message.reply_text(
-                    f"No matching keywords found in {source_label}.{details}",
+                    f"No saved keywords matched in {source_label}.{details}",
                     reply_markup=build_main_menu_markup(),
                 )
         return False
@@ -2468,9 +2492,9 @@ async def apply_keywords_input_for_source(
     if mode == "remove":
         if update.message:
             lines = [
-                f"<b>Updated {html.escape(source_label)} keywords</b>",
+                f"<b>{html.escape(source_label)} Keywords Updated</b>",
                 "",
-                f"<b>Removed {len(removed)} keyword(s)</b>",
+                f"<b>Removed</b> ({len(removed)})",
                 _html_bullets(removed),
             ]
             if missing:
@@ -2484,7 +2508,7 @@ async def apply_keywords_input_for_source(
             lines.extend(
                 [
                     "",
-                    f"<b>{html.escape(source_label)} keywords</b>",
+                    f"<b>Current {html.escape(source_label)} keywords</b>",
                     body_html,
                 ]
             )
@@ -2502,41 +2526,44 @@ async def apply_keywords_input_for_source(
         logger.exception("Failed to refresh after keyword change")
         if update.message:
             await update.message.reply_text(
-                f"{source_label} keywords updated, but refresh failed:\n{exc}",
+                f"{source_label} keywords were saved, but the results could not be refreshed:\n{exc}",
                 reply_markup=build_main_menu_markup(),
             )
         return False
 
     if update.message:
         hours_back = int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK))
+        scope = _normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY))
         lines: List[str] = [
-            f"<b>Added {len(added)} keyword(s) to {html.escape(source_label)}</b>",
+            f"<b>{html.escape(source_label)} Keywords Updated</b>",
+            "",
+            f"<b>Added</b> ({len(added)})",
             _html_bullets(added),
         ]
         if skipped:
             lines.extend(
                 [
                     "",
-                    "<b>Skipped (already present)</b>",
+                    "<b>Skipped</b> (already present)",
                     _html_bullets(skipped),
                 ]
             )
         lines.extend(
             [
                 "",
-                f"<b>{html.escape(source_label)} keywords</b>",
+                f"<b>Current {html.escape(source_label)} keywords</b>",
                 body_html,
                 "",
                 (
-                    f"<b>Found {len(papers)} matching paper(s)</b> in the last "
+                    f"<b>{len(papers)} matching paper(s)</b> in the last "
                     f"<b>{hours_back} hours</b>.\n"
-                    "Tap the button below to open results now."
+                    "Tap below to open them."
                 ),
             ]
         )
         await update.message.reply_text(
             "\n".join(lines),
-            reply_markup=build_open_results_markup(hours_back),
+            reply_markup=build_open_results_markup(hours_back, scope=scope),
             parse_mode=ParseMode.HTML,
         )
         return True
@@ -2560,13 +2587,13 @@ async def apply_set_keywords_for_source(
     user_id = _get_user_id(update)
     if user_id is None:
         if update.message:
-            await update.message.reply_text("Could not determine which Telegram user sent this command.")
+            await update.message.reply_text("Could not identify your Telegram user.")
         return False
 
     keywords = parse_keywords_input(raw)
     if not keywords:
         if update.message:
-            await update.message.reply_text("No valid keywords found.")
+            await update.message.reply_text("No valid keywords found. Send at least one keyword.")
         return False
 
     source_label = paper_source_label(source)
@@ -2583,17 +2610,17 @@ async def apply_set_keywords_for_source(
         logger.exception("Failed to refresh after setting source keywords")
         if update.message:
             await update.message.reply_text(
-                f"{source_label} keywords updated, but refresh failed:\n{exc}",
+                f"{source_label} keywords were saved, but the results could not be refreshed:\n{exc}",
                 reply_markup=build_main_menu_markup(),
             )
         return False
 
     if update.message:
+        updated_body = "\n".join(f"• {html.escape(item)}" for item in updated) if updated else "(none)"
         await update.message.reply_text(
-            f"{source_label} keywords set to:\n- "
-            + "\n- ".join(updated if updated else ["(none)"])
-            ,
+            f"<b>{html.escape(source_label)} Keywords Set</b>\n\n{updated_body}",
             reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
         )
     await send_open_results_prompt(
         update=update,
@@ -2612,7 +2639,7 @@ async def apply_search_hours_input(
 ) -> bool:
     if hours <= 0:
         if update.message:
-            await update.message.reply_text("Hours must be positive.")
+            await update.message.reply_text("Hours must be greater than 0.")
         return False
 
     return await run_search_for_hours(
@@ -2635,7 +2662,7 @@ async def setkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if len(context.args) < 2:
             if update.message:
                 await update.message.reply_text(
-                    "Format:\n"
+                    "Use this format:\n"
                     "arxiv kw1, kw2 + kw3\n"
                     "pubmed kw1, kw2 + kw3\n\n"
                     "Use commas for OR and + for AND inside one clause.\n\n"
@@ -2659,7 +2686,7 @@ async def clear_keywords_for_source(
     user_id = _get_user_id(update)
     if user_id is None:
         if update.message:
-            await update.message.reply_text("Could not determine which Telegram user sent this command.")
+            await update.message.reply_text("Could not identify your Telegram user.")
         return False
 
     source_label = paper_source_label(source)
@@ -2672,7 +2699,7 @@ async def clear_keywords_for_source(
 
     if update.message:
         await update.message.reply_text(
-            f"🧹 Cleared all keywords for {source_label}.",
+            f"Cleared all {source_label} keywords.",
             reply_markup=build_main_menu_markup(),
         )
     return True
@@ -2682,7 +2709,7 @@ async def clearkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user_id = _get_user_id(update)
     if user_id is None:
         if update.message:
-            await update.message.reply_text("Could not determine which Telegram user sent this command.")
+            await update.message.reply_text("Could not identify your Telegram user.")
         return
 
     _clear_pending_input_flags(context)
@@ -2690,7 +2717,7 @@ async def clearkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if context.args and source is None:
         if update.message:
             await update.message.reply_text(
-                "Choose one source to clear:\n"
+                "Choose one source:\n"
                 "- arxiv\n"
                 "- pubmed\n\n"
                 "Or use the clear buttons in the menu.",
@@ -2718,7 +2745,7 @@ async def clearkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if update.message:
         await update.message.reply_text(
-            "🧹 Cleared keywords for both sources.",
+            "Cleared keywords for both sources.",
             reply_markup=build_main_menu_markup(),
         )
 
@@ -2727,7 +2754,7 @@ async def addkeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if len(context.args) < 2:
         if update.message:
             await update.message.reply_text(
-                "Format:\n"
+                "Use this format:\n"
                 "arxiv quantum mechanics\n"
                 "arxiv astronomy, climate change + photosynthesis\n"
                 "pubmed genetics\n\n"
@@ -2758,11 +2785,11 @@ async def removekeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if len(context.args) < 2:
         if update.message:
             await update.message.reply_text(
-                "Format:\n"
+                "Use this format:\n"
                 "arxiv quantum mechanics\n"
                 "arxiv astronomy, climate change + photosynthesis\n"
                 "pubmed genetics\n\n"
-                "Use the exact saved clause when removing keywords.\n\n"
+                "When removing keywords, use the saved clause exactly.\n\n"
                 f"Or use {MENU_BTN_REMOVE_ARXIV_KEYWORD} / {MENU_BTN_REMOVE_PUBMED_KEYWORD}.",
                 reply_markup=build_main_menu_markup(),
             )
@@ -2832,11 +2859,11 @@ async def show_recap_timezone_picker(
         safe_page = min(max(0, page), total_pages - 1)
         text = (
             "<b>Set Recap Time</b>\n\n"
-            "Choose a time zone for your local recap schedule.\n\n"
+            "Choose the time zone for your recap schedule.\n\n"
             f"<b>Current time zone</b>: <code>{html.escape(current_timezone)}</code>\n"
             f"<b>Current local time</b>: {html.escape(current_local_time)}\n"
             f"<b>Browsing</b>: {html.escape(group)} ({safe_page + 1}/{total_pages})\n\n"
-            "Tap a time zone below or send an exact zone name such as "
+            "Tap a time zone below or send an exact name such as "
             "<code>Europe/Rome</code>."
         )
         reply_markup = build_recap_timezone_choices_markup(group, safe_page)
@@ -2844,10 +2871,10 @@ async def show_recap_timezone_picker(
         text = (
             "<b>Set Recap Time</b>\n\n"
             "1. Choose your time zone.\n"
-            "2. Then send one or more local recap times as HH:MM.\n\n"
+            "2. Send one or more local times as HH:MM.\n\n"
             f"<b>Current time zone</b>: <code>{html.escape(current_timezone)}</code>\n"
             f"<b>Current local time</b>: {html.escape(current_local_time)}\n\n"
-            "Browse all available time zones by region below, or send an exact "
+            "Browse time zones by region below, or send an exact "
             "zone name such as <code>Europe/Rome</code>."
         )
         reply_markup = build_recap_timezone_regions_markup()
@@ -2896,8 +2923,8 @@ async def prompt_recap_local_time_input(
         "<b>Set Recap Time</b>\n\n"
         f"<b>Time zone</b>: <code>{html.escape(resolved_timezone)}</code>\n"
         f"<b>Current local time</b>: {html.escape(local_now_label)}\n\n"
-        "Send one or more local recap times as HH:MM.\n"
-        "Use commas or spaces to separate multiple times.\n\n"
+        "Send one or more local times as HH:MM.\n"
+        "Use commas or spaces to separate them.\n\n"
         "<b>Examples</b>\n"
         "<code>09:30</code>\n"
         "<code>09:30, 21:00</code>"
@@ -2936,8 +2963,9 @@ async def apply_recap_timezone_input(
     if not cleaned:
         if update.message:
             await update.message.reply_text(
-                "Please choose a time zone from the list or send an exact name such as Europe/Rome.",
+                "Choose a time zone from the list or send an exact name such as <code>Europe/Rome</code>.",
                 reply_markup=build_main_menu_markup(),
+                parse_mode=ParseMode.HTML,
             )
         return False
 
@@ -2946,9 +2974,10 @@ async def apply_recap_timezone_input(
     if tz_name is None:
         if update.message:
             await update.message.reply_text(
-                "Invalid time zone.\n"
-                "Send an exact available name such as Europe/Rome, US/Eastern, or UTC.",
+                "Time zone not recognized.\n"
+                "Send an exact name such as <code>Europe/Rome</code>, <code>US/Eastern</code>, or <code>UTC</code>.",
                 reply_markup=build_main_menu_markup(),
+                parse_mode=ParseMode.HTML,
             )
         return False
 
@@ -2964,7 +2993,7 @@ async def dailyrecap_status_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = _get_user_id(update)
     if user_id is None:
         if update.message:
-            await update.message.reply_text("Could not determine which Telegram user sent this command.")
+            await update.message.reply_text("Could not identify your Telegram user.")
         return
 
     enabled, recap_times, chat_id = get_daily_recap_config(user_id)
@@ -2975,14 +3004,15 @@ async def dailyrecap_status_cmd(update: Update, context: ContextTypes.DEFAULT_TY
 
     if update.message:
         await update.message.reply_text(
-            "Daily recap status:\n"
-            f"- Status: {status}\n"
-            f"- Time zone: {recap_timezone}\n"
-            f"- Times (local): {times_label}\n"
-            f"- Current local time: {format_recap_timezone_clock(recap_timezone)}\n"
-            f"- Chat ID: {chat_label}\n\n"
-            f"Use {MENU_BTN_DAILY_RECAP} and {MENU_BTN_SET_RECAP_TIME}.",
+            "<b>Daily Recap</b>\n\n"
+            f"<b>Status</b>: {html.escape(status)}\n"
+            f"<b>Time zone</b>: <code>{html.escape(recap_timezone)}</code>\n"
+            f"<b>Times</b>: {html.escape(times_label)}\n"
+            f"<b>Local time now</b>: {html.escape(format_recap_timezone_clock(recap_timezone))}\n"
+            f"<b>Chat ID</b>: <code>{html.escape(chat_label)}</code>\n\n"
+            f"Use <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b> and <b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b> to change these settings.",
             reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -3001,7 +3031,7 @@ async def apply_recap_time_input(
     chat = update.effective_chat
     if user_id is None or chat is None:
         if update.message:
-            await update.message.reply_text("Could not determine user/chat for recap settings.")
+            await update.message.reply_text("Could not identify this user or chat for recap settings.")
         return False
 
     recap_timezone = _coerce_daily_recap_timezone(
@@ -3011,7 +3041,7 @@ async def apply_recap_time_input(
     if recap_times is None:
         if update.message:
             await update.message.reply_text(
-                "Invalid time format.\n"
+                "Time format not recognized.\n"
                 f"Use one or more HH:MM times in {recap_timezone}.\n"
                 "Examples: 09:30 or 09:30, 21:00."
             )
@@ -3019,7 +3049,7 @@ async def apply_recap_time_input(
     if not recap_times:
         if update.message:
             await update.message.reply_text(
-                "Please provide at least one time.\n"
+                "Send at least one time.\n"
                 f"Example in {recap_timezone}: 09:30 or 09:30, 21:00."
             )
         return False
@@ -3043,14 +3073,14 @@ async def apply_recap_time_input(
         except Exception as exc:
             logger.exception("Could not reschedule daily recap after time update")
             if update.message:
-                await update.message.reply_text(f"Time saved, but scheduling failed:\n{exc}")
+                await update.message.reply_text(f"Times were saved, but scheduling failed:\n{exc}")
             return False
 
     if update.message:
         times_label = ", ".join(recap_times)
         await update.message.reply_text(
-            f"Daily recap times set to {times_label} in {recap_timezone}."
-            + (" Recap is active." if enabled else " Recap is currently OFF."),
+            f"Recap times saved: {times_label} ({recap_timezone})."
+            + (" Recap is active." if enabled else " Recap is currently off."),
             reply_markup=build_main_menu_markup(),
         )
     context.user_data.pop("awaiting_recap_time_input", None)
@@ -3087,7 +3117,7 @@ async def set_daily_recap_enabled(
     chat = update.effective_chat
     if user_id is None or chat is None:
         if update.message:
-            await update.message.reply_text("Could not determine user/chat for recap settings.")
+            await update.message.reply_text("Could not identify this user or chat for recap settings.")
         return False
 
     _, recap_times, _ = get_daily_recap_config(user_id)
@@ -3110,16 +3140,17 @@ async def set_daily_recap_enabled(
         except Exception as exc:
             logger.exception("Could not enable daily recap")
             if update.message:
-                await update.message.reply_text(f"Could not enable daily recap:\n{exc}")
+                await update.message.reply_text(f"Could not enable the daily recap:\n{exc}")
             return False
         times_label = ", ".join(recap_times)
         message = (
-            f"Daily recap enabled. You will receive updates every day at {times_label} in {recap_timezone}.\n"
-            f"Each recap includes papers from the last {DAILY_RECAP_HOURS} hours."
+            f"Daily recap is on.\n"
+            f"You will receive updates every day at {times_label} in {recap_timezone}.\n"
+            f"Each recap covers the last {DAILY_RECAP_HOURS} hours."
         )
     else:
         remove_daily_recap_job(context.application, user_id)
-        message = "Daily recap disabled."
+        message = "Daily recap is off."
 
     if update.message:
         await update.message.reply_text(message, reply_markup=build_main_menu_markup())
@@ -3130,7 +3161,7 @@ async def toggledailyrecap_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = _get_user_id(update)
     if user_id is None:
         if update.message:
-            await update.message.reply_text("Could not determine which Telegram user sent this command.")
+            await update.message.reply_text("Could not identify your Telegram user.")
         return
     enabled, _, _ = get_daily_recap_config(user_id)
     await set_daily_recap_enabled(update, context, not enabled)
@@ -3154,7 +3185,7 @@ async def dailyrecap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if update.message:
         await update.message.reply_text(
-            f"Use {MENU_BTN_DAILY_RECAP} to toggle recap and {MENU_BTN_RECAP_STATUS} to check status.",
+            f"Use {MENU_BTN_DAILY_RECAP} to turn the recap on or off, and {MENU_BTN_RECAP_STATUS} to view the current settings.",
             reply_markup=build_main_menu_markup(),
         )
 
@@ -3176,7 +3207,7 @@ async def recap_timezone_callback(update: Update, context: ContextTypes.DEFAULT_
             group, page_text = payload.rsplit(":", 1)
             page = int(page_text)
         except ValueError:
-            await query.answer("Invalid time zone page.", show_alert=True)
+            await query.answer("This time zone page is invalid.", show_alert=True)
             return
         await query.answer()
         await show_recap_timezone_picker(update, context, group=group, page=page)
@@ -3187,7 +3218,7 @@ async def recap_timezone_callback(update: Update, context: ContextTypes.DEFAULT_
         try:
             zone_name = AVAILABLE_RECAP_TIMEZONES[int(raw_index)]
         except (ValueError, IndexError):
-            await query.answer("Invalid time zone.", show_alert=True)
+            await query.answer("Time zone not recognized.", show_alert=True)
             return
         await query.answer(f"Selected {zone_name}")
         await prompt_recap_local_time_input(update, context, zone_name)
@@ -3214,20 +3245,104 @@ async def open_matches_callback(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         hours_back = int(raw_hours)
     except ValueError:
-        await query.answer("Invalid range.", show_alert=True)
+        await query.answer("Invalid time range.", show_alert=True)
         return
 
     if hours_back <= 0:
-        await query.answer("Invalid range.", show_alert=True)
+        await query.answer("Invalid time range.", show_alert=True)
         return
 
-    await query.answer("Fetching results...")
+    await query.answer("Loading results...")
     await run_search_for_hours(
         update=update,
         context=context,
         hours_back=hours_back,
         force_refresh=True,
         scope=scope,
+    )
+
+
+async def more_results_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    chat = update.effective_chat
+    if query is None:
+        return
+
+    data = query.data or ""
+    if not data.startswith("more_results:"):
+        await query.answer()
+        return
+
+    parts = data.split(":", 4)
+    if len(parts) != 5:
+        await query.answer("This results page is invalid.", show_alert=True)
+        return
+
+    _, raw_token, raw_scope, raw_hours, raw_offset = parts
+    scope = _normalize_search_scope(raw_scope)
+    try:
+        results_token = int(raw_token)
+        hours_back = int(raw_hours)
+        offset = int(raw_offset)
+    except ValueError:
+        await query.answer("This results page is invalid.", show_alert=True)
+        return
+
+    if hours_back <= 0 or offset < 0:
+        await query.answer("This results page is invalid.", show_alert=True)
+        return
+
+    cached_token = int(context.user_data.get("results_token", 0) or 0)
+    papers = get_cached_papers(context, hours_back=hours_back, scope=scope)
+    if cached_token != results_token or not papers:
+        await query.answer(
+            f"These results are no longer current. Open {MENU_BTN_TODAY} again.",
+            show_alert=True,
+        )
+        return
+
+    if offset >= len(papers):
+        await query.answer("No more results.")
+        if query.message is not None:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        return
+
+    await query.answer("Loading more results...")
+    if query.message is not None:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            logger.exception("Could not clear More button markup")
+
+    async def send_text(
+        text: str,
+        *,
+        reply_markup: Optional[Any] = None,
+        parse_mode: Optional[str] = None,
+        disable_web_page_preview: Optional[bool] = None,
+    ) -> None:
+        if chat is None:
+            raise RuntimeError("Could not determine the Telegram chat for paginated results.")
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+
+    await send_results_page(
+        send_text,
+        context=context,
+        papers=papers,
+        user_id=_get_user_id(update),
+        hours_back=hours_back,
+        scope=scope,
+        results_token=results_token,
+        start_index=offset,
     )
 
 
@@ -3309,7 +3424,7 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             hours = int(text)
         except ValueError:
-            await message.reply_text("Hours must be an integer. Action canceled.")
+            await message.reply_text("Hours must be an integer. Action cancelled.")
             context.user_data.pop("awaiting_search_hours_input", None)
             context.user_data.pop("awaiting_hours_input", None)
             return
@@ -3327,7 +3442,7 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     await message.reply_text(
-        "Use the keyboard buttons below.",
+        "Use the buttons below.",
         reply_markup=build_main_menu_markup(),
     )
 
@@ -3378,7 +3493,7 @@ async def debugquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Backward-compatible alias: refresh now behaves exactly like Today.
+    # Backward-compatible alias: refresh now behaves exactly like Last 24h.
     await today_cmd(update, context)
 
 
@@ -3428,7 +3543,7 @@ async def run_search_for_hours(
             )
         except Exception as exc:
             logger.exception("Search refresh failed")
-            await send_text(f"Could not fetch papers:\n{exc}")
+            await send_text(f"Could not load papers:\n{exc}")
             return False
 
     if not papers:
@@ -3440,37 +3555,36 @@ async def run_search_for_hours(
 
         if not query:
             text = (
-                "No active query is set.\n\n"
+                "No keywords set yet.\n\n"
                 f"Use {MENU_BTN_ADD_ARXIV_KEYWORD} and {MENU_BTN_ADD_PUBMED_KEYWORD} "
-                "to define your keywords."
+                "to add your keywords."
             )
         else:
             text = (
                 f"No matching papers found in {_describe_search_window(effective_scope, hours_back)}.\n"
-                f"Raw entries fetched: {raw_count} "
+                f"Raw entries: {raw_count} "
                 f"(arXiv: {arxiv_raw}, PubMed: {pubmed_raw})\n\n"
-                f"Adjust keywords via {MENU_BTN_KEYWORDS} and try again."
+                f"Review your keywords in {MENU_BTN_KEYWORDS} and try again."
             )
 
         await send_text(text, reply_markup=build_main_menu_markup())
         return True
 
     await send_text(
-        f"Found {len(papers)} matching paper(s) in {_describe_search_window(effective_scope, hours_back)}.",
+        f"{len(papers)} matching paper(s) found in {_describe_search_window(effective_scope, hours_back)}.",
         reply_markup=build_main_menu_markup(),
     )
 
-    bookmarks = set(get_bookmarks(context.user_data, user_id=user_id))
-    for paper in papers:
-        await send_text(
-            format_paper_line(paper),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=build_paper_reply_markup(
-                paper,
-                bookmarked=paper_ref_for(paper) in bookmarks,
-            ),
-        )
+    await send_results_page(
+        send_text,
+        context=context,
+        papers=papers,
+        user_id=user_id,
+        hours_back=hours_back,
+        scope=effective_scope,
+        results_token=int(context.user_data.get("results_token", 0) or 0),
+        start_index=0,
+    )
     return True
 
 
@@ -3517,7 +3631,7 @@ async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     parsed_ref = parse_paper_ref(data.removeprefix("pdf:").strip())
     if parsed_ref is None:
-        await query.answer("Missing paper identifier.", show_alert=True)
+        await query.answer("Paper identifier is missing.", show_alert=True)
         return
     source, paper_id = parsed_ref
 
@@ -3531,14 +3645,14 @@ async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if chat is not None:
                 await context.bot.send_message(
                     chat_id=chat.id,
-                    text=f"Could not fetch papers:\n{exc}",
+                    text=f"Could not load papers:\n{exc}",
                 )
             return
         paper = find_cached_paper_by_ref(context, source, paper_id)
 
     if paper is None:
         await query.answer(
-            f"This paper is no longer in your current list. Run {MENU_BTN_TODAY} again.",
+            f"This paper is no longer in the current list. Open {MENU_BTN_TODAY} again.",
             show_alert=True,
         )
         return
@@ -3566,7 +3680,7 @@ async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await context.bot.send_message(
                 chat_id=chat.id,
                 text=(
-                    "Could not send the PDF file through Telegram.\n\n"
+                    "Could not send the PDF through Telegram.\n\n"
                     f"Direct PDF link:\n{paper.link_pdf}"
                 ),
             )
@@ -3584,14 +3698,14 @@ async def bookmark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     parsed_ref = parse_paper_ref(data.removeprefix("bm:").strip())
     if parsed_ref is None:
-        await query.answer("Missing paper identifier.", show_alert=True)
+        await query.answer("Paper identifier is missing.", show_alert=True)
         return
     source, paper_id = parsed_ref
     paper_ref = make_paper_ref(source, paper_id)
 
     user_id = _get_user_id(update)
     if user_id is None:
-        await query.answer("Could not determine Telegram user.", show_alert=True)
+        await query.answer("Could not identify your Telegram user.", show_alert=True)
         return
 
     bookmarks = get_bookmarks(context.user_data, user_id=user_id)
@@ -3633,14 +3747,14 @@ async def bookmarks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = _get_user_id(update)
     if user_id is None:
         if update.message:
-            await update.message.reply_text("Could not determine which Telegram user sent this command.")
+            await update.message.reply_text("Could not identify your Telegram user.")
         return
 
     bookmark_ids = get_bookmarks(context.user_data, user_id=user_id)
     if not bookmark_ids:
         if update.message:
             await update.message.reply_text(
-                f"No bookmarks yet. Use ⭐ on a paper from {MENU_BTN_TODAY}.",
+                f"No bookmarks yet.\nUse ⭐ on a paper from {MENU_BTN_TODAY}.",
                 reply_markup=build_main_menu_markup(),
             )
         return
@@ -3659,7 +3773,7 @@ async def bookmarks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not papers:
         if update.message:
             await update.message.reply_text(
-                "No bookmarked papers could be retrieved from sources right now.",
+                "No bookmarked papers could be loaded right now.",
                 reply_markup=build_main_menu_markup(),
             )
         return
@@ -3730,6 +3844,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_router))
     app.add_handler(CallbackQueryHandler(recap_timezone_callback, pattern=r"^rtz"))
     app.add_handler(CallbackQueryHandler(open_matches_callback, pattern=r"^open_matches:"))
+    app.add_handler(CallbackQueryHandler(more_results_callback, pattern=r"^more_results:"))
     app.add_handler(CallbackQueryHandler(pdf_callback, pattern=r"^pdf:"))
     app.add_handler(CallbackQueryHandler(bookmark_callback, pattern=r"^bm:"))
 

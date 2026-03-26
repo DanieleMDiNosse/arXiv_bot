@@ -20,7 +20,10 @@
       ]
     },
     "140139665": {
-      "welcome_shown_at": "2026-03-25T15:16:34+00:00"
+      "welcome_shown_at": "2026-03-25T15:16:34+00:00",
+      "custom_keywords_arxiv": [
+        "llm"
+      ]
     },
     "914436997": {
       "welcome_shown_at": "2026-03-25T15:17:34+00:00",
@@ -30,17 +33,25 @@
       ]
     },
     "373851206": {
-      "custom_keywords_arxiv": [
-        "Llm",
-        "Physics"
-      ],
       "daily_recap_times": [
         "08:30"
       ],
       "daily_recap_time": "08:30",
       "daily_recap_timezone": "Europe/Rome",
       "daily_recap_chat_id": 373851206,
-      "daily_recap_enabled": true
+      "daily_recap_enabled": true,
+      "custom_keywords_arxiv": [
+        "Defi",
+        "market microstructure",
+        "decentralized finance",
+        "crypto automated market makers",
+        "blockchain",
+        "price impact",
+        "econophysics"
+      ],
+      "bookmarks": [
+        "arxiv:2603.24137v1"
+      ]
     }
   },
   "hours_back": 24
