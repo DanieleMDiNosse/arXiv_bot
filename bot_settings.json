@@ -21,12 +21,23 @@
     },
     "140139665": {
       "welcome_shown_at": "2026-03-25T15:16:34+00:00",
-      "custom_keywords_pubmed": [
-        "anesthesia + liver"
-      ],
+      "custom_keywords_pubmed": [],
       "bookmarks": [
         "pubmed:41840968",
         "pubmed:41840485"
+      ],
+      "custom_keywords_arxiv": [
+        "crypto",
+        "ethereum"
+      ],
+      "custom_keywords_biorxiv": [],
+      "custom_keywords_medrxiv": [],
+      "custom_keywords_chemrxiv": [
+        "molecules",
+        "carbon"
+      ],
+      "custom_keywords_ssrn": [
+        "llm"
       ]
     },
     "914436997": {

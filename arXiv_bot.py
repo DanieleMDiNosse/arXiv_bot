@@ -10,10 +10,12 @@ import math
 import os
 import re
 import shlex
+import time as systime
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, List, Optional, Sequence
 from zoneinfo import ZoneInfo, available_timezones
 
@@ -38,15 +40,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ARXIV_API_URL = "http://export.arxiv.org/api/query"
+RXIV_DETAILS_API_URL = "https://api.biorxiv.org/details"
 PUBMED_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+CROSSREF_WORKS_URL = "https://api.crossref.org/works"
+OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 DEFAULT_MAX_RESULTS = int(os.getenv("MAX_RESULTS", "300"))
 TODAY_HOURS_BACK = 24
 DAILY_RECAP_HOURS = 24
 RESULTS_PAGE_SIZE = max(1, int(os.getenv("RESULTS_PAGE_SIZE", "10")))
 DEFAULT_DAILY_RECAP_TIME = "09:00"
 DEFAULT_DAILY_RECAP_TIMEZONE = "UTC"
-MAX_DAILY_RECAP_ITEMS = int(os.getenv("DAILY_RECAP_MAX_ITEMS", "20"))
 MAX_ABSTRACT_CHARS = int(os.getenv("MAX_ABSTRACT_CHARS", "1600"))
 PUBMED_FUTURE_GRACE_DAYS = int(os.getenv("PUBMED_FUTURE_GRACE_DAYS", "2"))
 RECAP_TIMEZONE_PAGE_SIZE = max(1, int(os.getenv("RECAP_TIMEZONE_PAGE_SIZE", "8")))
@@ -72,13 +76,10 @@ REPORT_FORWARD_CHAT_ID = os.getenv("REPORT_FORWARD_CHAT_ID", "").strip()
 SETTINGS_FILE = Path("bot_settings.json")
 MENU_BTN_TODAY = "Last 24h"
 MENU_BTN_KEYWORDS = "Keywords"
-MENU_BTN_ADD_ARXIV_KEYWORD = "Add arXiv keywords"
-MENU_BTN_REMOVE_ARXIV_KEYWORD = "Remove arXiv keywords"
-MENU_BTN_CLEAR_ARXIV_KEYWORD = "🧹 arXiv keywords"
-MENU_BTN_ADD_PUBMED_KEYWORD = "Add PubMed keywords"
-MENU_BTN_REMOVE_PUBMED_KEYWORD = "Remove PubMed keywords"
-MENU_BTN_CLEAR_PUBMED_KEYWORD = "🧹 PubMed keywords"
-MENU_BTN_SEARCH_HOURS = "Search Hours"
+MENU_BTN_ADD_KEYWORDS = "Add keywords"
+MENU_BTN_REMOVE_KEYWORDS = "Remove keywords"
+MENU_BTN_CLEAR_KEYWORDS = "🧹 Clear keywords"
+MENU_BTN_SEARCH_HOURS = "Search Last N Hours"
 MENU_BTN_DAILY_RECAP = "Recap On/Off"
 MENU_BTN_SET_RECAP_TIME = "Recap Time"
 MENU_BTN_RECAP_STATUS = "Recap Status"
@@ -87,10 +88,30 @@ MENU_BTN_HELP = "Help"
 MENU_BTN_REPORT = "Report issue"
 MENU_BTN_COFFEE = "Pay me a coffee"
 SOURCE_ARXIV = "arxiv"
+SOURCE_BIORXIV = "biorxiv"
+SOURCE_MEDRXIV = "medrxiv"
+SOURCE_CHEMRXIV = "chemrxiv"
+SOURCE_SSRN = "ssrn"
 SOURCE_PUBMED = "pubmed"
+KEYWORD_SCOPE_ALL = "all"
 WELCOME_SHOWN_AT_KEY = "welcome_shown_at"
 SEARCH_SCOPE_TODAY = "today"
 SEARCH_SCOPE_HOURS = "hours"
+
+ARXIV_FAMILY_SOURCES = {
+    SOURCE_ARXIV,
+    SOURCE_BIORXIV,
+    SOURCE_MEDRXIV,
+    SOURCE_CHEMRXIV,
+}
+ALL_PAPER_SOURCES = ARXIV_FAMILY_SOURCES | {SOURCE_PUBMED}
+KEYWORD_SOURCES_ORDER = [
+    SOURCE_ARXIV,
+    SOURCE_BIORXIV,
+    SOURCE_MEDRXIV,
+    SOURCE_CHEMRXIV,
+    SOURCE_PUBMED,
+]
 
 
 def build_main_menu_markup() -> ReplyKeyboardMarkup:
@@ -98,22 +119,46 @@ def build_main_menu_markup() -> ReplyKeyboardMarkup:
         keyboard=[
             [MENU_BTN_TODAY, MENU_BTN_SEARCH_HOURS],
             [MENU_BTN_KEYWORDS, MENU_BTN_BOOKMARKS],
-            [
-                MENU_BTN_ADD_ARXIV_KEYWORD,
-                MENU_BTN_REMOVE_ARXIV_KEYWORD,
-                MENU_BTN_CLEAR_ARXIV_KEYWORD,
-            ],
-            [
-                MENU_BTN_ADD_PUBMED_KEYWORD,
-                MENU_BTN_REMOVE_PUBMED_KEYWORD,
-                MENU_BTN_CLEAR_PUBMED_KEYWORD,
-            ],
+            [MENU_BTN_ADD_KEYWORDS, MENU_BTN_REMOVE_KEYWORDS, MENU_BTN_CLEAR_KEYWORDS],
             [MENU_BTN_DAILY_RECAP, MENU_BTN_SET_RECAP_TIME, MENU_BTN_RECAP_STATUS],
             [MENU_BTN_HELP],
             [MENU_BTN_REPORT, MENU_BTN_COFFEE],
         ],
         resize_keyboard=True,
     )
+
+
+def _keyword_action_label(action: str) -> str:
+    action_norm = str(action or "").strip().casefold()
+    if action_norm == "add":
+        return MENU_BTN_ADD_KEYWORDS
+    if action_norm == "remove":
+        return MENU_BTN_REMOVE_KEYWORDS
+    if action_norm == "clear":
+        return MENU_BTN_CLEAR_KEYWORDS
+    return "Keywords"
+
+
+def build_keyword_scope_markup(action: str) -> InlineKeyboardMarkup:
+    """Inline submenu to choose where one keyword action should apply."""
+    action_norm = str(action or "").strip().casefold()
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="arXiv", callback_data=f"kwmenu:{action_norm}:{SOURCE_ARXIV}"),
+            InlineKeyboardButton(text="bioRxiv", callback_data=f"kwmenu:{action_norm}:{SOURCE_BIORXIV}"),
+        ],
+        [
+            InlineKeyboardButton(text="medRxiv", callback_data=f"kwmenu:{action_norm}:{SOURCE_MEDRXIV}"),
+            InlineKeyboardButton(text="ChemRxiv", callback_data=f"kwmenu:{action_norm}:{SOURCE_CHEMRXIV}"),
+        ],
+        [
+            InlineKeyboardButton(text="PubMed", callback_data=f"kwmenu:{action_norm}:{SOURCE_PUBMED}"),
+        ],
+        [
+            InlineKeyboardButton(text="All sources", callback_data=f"kwmenu:{action_norm}:{KEYWORD_SCOPE_ALL}"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def build_coffee_markup() -> Optional[InlineKeyboardMarkup]:
@@ -367,7 +412,7 @@ def parse_paper_ref(raw: str, default_source: str = SOURCE_ARXIV) -> Optional[tu
         source, paper_id = token.split(":", 1)
         source = source.strip().casefold()
         paper_id = paper_id.strip()
-        if source in {SOURCE_ARXIV, SOURCE_PUBMED} and paper_id:
+        if source in ALL_PAPER_SOURCES and paper_id:
             return source, paper_id
 
     return default_source, token
@@ -375,7 +420,7 @@ def parse_paper_ref(raw: str, default_source: str = SOURCE_ARXIV) -> Optional[tu
 
 def make_paper_ref(source: str, paper_id: str) -> str:
     source_norm = str(source or "").strip().casefold()
-    if source_norm not in {SOURCE_ARXIV, SOURCE_PUBMED}:
+    if source_norm not in ALL_PAPER_SOURCES:
         source_norm = SOURCE_ARXIV
     return f"{source_norm}:{(paper_id or '').strip()}"
 
@@ -385,7 +430,25 @@ def paper_ref_for(paper: Paper) -> str:
 
 
 def paper_source_label(source: str) -> str:
-    return "PubMed" if str(source).casefold() == SOURCE_PUBMED else "arXiv"
+    source_norm = str(source).casefold()
+    if source_norm == SOURCE_PUBMED:
+        return "PubMed"
+    if source_norm == SOURCE_BIORXIV:
+        return "bioRxiv"
+    if source_norm == SOURCE_MEDRXIV:
+        return "medRxiv"
+    if source_norm == SOURCE_CHEMRXIV:
+        return "ChemRxiv"
+    if source_norm == SOURCE_SSRN:
+        return "SSRN"
+    return "arXiv"
+
+
+def keyword_source_label(source: str) -> str:
+    source_norm = str(source).casefold()
+    if source_norm == KEYWORD_SCOPE_ALL:
+        return "All sources"
+    return paper_source_label(source_norm)
 
 
 def get_bookmarks(
@@ -460,14 +523,28 @@ def parse_keyword_source(raw: str) -> Optional[str]:
     token = str(raw or "").strip().casefold()
     if token in {"arxiv", "ax"}:
         return SOURCE_ARXIV
+    if token in {"biorxiv", "bio", "bx"}:
+        return SOURCE_BIORXIV
+    if token in {"medrxiv", "med", "mx"}:
+        return SOURCE_MEDRXIV
+    if token in {"chemrxiv", "chem", "cx"}:
+        return SOURCE_CHEMRXIV
     if token in {"pubmed", "pm"}:
         return SOURCE_PUBMED
+    if token in {"all", "*"}:
+        return KEYWORD_SCOPE_ALL
     return None
 
 
 def _keyword_cache_key_for_source(source: str) -> str:
-    source_norm = SOURCE_PUBMED if source == SOURCE_PUBMED else SOURCE_ARXIV
+    source_norm = str(source or "").strip().casefold()
+    if source_norm not in ALL_PAPER_SOURCES:
+        source_norm = SOURCE_ARXIV
     return f"custom_keywords_{source_norm}"
+
+
+def keyword_sources() -> List[str]:
+    return [source for source in KEYWORD_SOURCES_ORDER if source in ALL_PAPER_SOURCES]
 
 
 def get_keywords_for_source(
@@ -475,7 +552,9 @@ def get_keywords_for_source(
     user_data: Optional[dict[str, Any]] = None,
     user_id: Optional[int] = None,
 ) -> List[str]:
-    source_norm = SOURCE_PUBMED if source == SOURCE_PUBMED else SOURCE_ARXIV
+    source_norm = str(source or "").strip().casefold()
+    if source_norm not in ALL_PAPER_SOURCES:
+        source_norm = SOURCE_ARXIV
     cache_key = _keyword_cache_key_for_source(source_norm)
     if user_data is not None and cache_key in user_data:
         return list(user_data[cache_key])
@@ -488,17 +567,32 @@ def get_keywords_for_source(
             if user_data is not None:
                 user_data[cache_key] = keywords
             return keywords
-        if "custom_keywords" in user_settings:
+        if source_norm == SOURCE_ARXIV and "custom_keywords" in user_settings:
             keywords = list(user_settings["custom_keywords"])
             if user_data is not None:
                 user_data[cache_key] = keywords
             return keywords
+        # Backward compatibility: old setup had one shared arXiv-family list.
+        if (
+            source_norm in ARXIV_FAMILY_SOURCES
+            and source_norm != SOURCE_ARXIV
+            and _keyword_cache_key_for_source(SOURCE_ARXIV) in user_settings
+        ):
+            keywords = list(user_settings[_keyword_cache_key_for_source(SOURCE_ARXIV)])
+            if user_data is not None:
+                user_data[cache_key] = keywords
+            return keywords
 
-    env_name = "ARXIV_KEYWORDS" if source_norm == SOURCE_ARXIV else "PUBMED_KEYWORDS"
-    raw = os.getenv(env_name, "").strip()
-    if not raw and source_norm == SOURCE_PUBMED:
-        # Backward compatibility: reuse ARXIV_KEYWORDS if source-specific env
-        # is not configured yet.
+    env_name_map = {
+        SOURCE_ARXIV: "ARXIV_KEYWORDS",
+        SOURCE_BIORXIV: "BIORXIV_KEYWORDS",
+        SOURCE_MEDRXIV: "MEDRXIV_KEYWORDS",
+        SOURCE_CHEMRXIV: "CHEMRXIV_KEYWORDS",
+        SOURCE_PUBMED: "PUBMED_KEYWORDS",
+    }
+    raw = os.getenv(env_name_map[source_norm], "").strip()
+    if not raw and source_norm in ARXIV_FAMILY_SOURCES and source_norm != SOURCE_ARXIV:
+        # Backward compatibility: shared ARXIV_KEYWORDS for the preprint family.
         raw = os.getenv("ARXIV_KEYWORDS", "").strip()
     if not raw:
         return []
@@ -521,12 +615,12 @@ def get_keywords_by_source(
     user_id: Optional[int] = None,
 ) -> dict[str, List[str]]:
     return {
-        SOURCE_ARXIV: get_keywords_for_source(
-            SOURCE_ARXIV,
+        source: get_keywords_for_source(
+            source,
             user_data=user_data,
             user_id=user_id,
-        ),
-        SOURCE_PUBMED: get_keywords_for_pubmed(user_data=user_data, user_id=user_id),
+        )
+        for source in keyword_sources()
     }
 
 
@@ -536,7 +630,9 @@ def set_keywords_for_source(
     keywords: Sequence[str],
     user_data: Optional[dict[str, Any]] = None,
 ) -> List[str]:
-    source_norm = SOURCE_PUBMED if source == SOURCE_PUBMED else SOURCE_ARXIV
+    source_norm = str(source or "").strip().casefold()
+    if source_norm not in ALL_PAPER_SOURCES:
+        source_norm = SOURCE_ARXIV
     cache_key = _keyword_cache_key_for_source(source_norm)
 
     cleaned: List[str] = []
@@ -555,7 +651,7 @@ def set_keywords_for_source(
 
     if user_data is not None:
         user_data[cache_key] = cleaned
-    _save_user_setting(user_id, cache_key, cleaned if cleaned else None)
+    _save_user_setting(user_id, cache_key, cleaned)
     return cleaned
 
 
@@ -957,6 +1053,594 @@ def build_pubmed_query(keywords: Sequence[str]) -> Optional[str]:
         return None
 
     return "(" + " OR ".join(clauses) + ")"
+
+
+def _keywords_match_text(keywords: Sequence[str], text: str) -> bool:
+    """Return True when text matches OR-of-clauses keyword logic.
+
+    Each keyword entry is one OR clause. Inside one entry, '+' means AND.
+    """
+    haystack = normalize_text(text).casefold()
+    if not keywords:
+        return True
+    if not haystack:
+        return False
+
+    for keyword in keywords:
+        terms = [normalize_text(term).casefold() for term in str(keyword).split("+")]
+        terms = [term for term in terms if term]
+        if terms and all(term in haystack for term in terms):
+            return True
+    return False
+
+
+def _parse_datetime_or_none(raw: Any) -> Optional[datetime]:
+    text = normalize_text(str(raw or ""))
+    if not text:
+        return None
+    try:
+        parsed = dateparser.parse(text)
+    except Exception:
+        return None
+    if parsed is None:
+        return None
+    return ensure_utc(parsed)
+
+
+def _parse_crossref_date_parts(node: Any) -> Optional[datetime]:
+    if not isinstance(node, dict):
+        return None
+    date_parts = node.get("date-parts")
+    if not isinstance(date_parts, list) or not date_parts:
+        return None
+    first = date_parts[0]
+    if not isinstance(first, list) or not first:
+        return None
+    try:
+        year = int(first[0])
+        month = int(first[1]) if len(first) > 1 else 1
+        day = int(first[2]) if len(first) > 2 else 1
+        return datetime(year=year, month=month, day=day, tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _rxiv_record_to_paper(
+    record: dict[str, Any],
+    *,
+    source: str,
+    host: str,
+) -> Optional[Paper]:
+    doi = normalize_text(str(record.get("doi") or ""))
+    if not doi:
+        return None
+
+    version_raw = normalize_text(str(record.get("version") or ""))
+    version_suffix = f"v{version_raw}" if version_raw and version_raw.isdigit() else ""
+    paper_id = f"{doi}{version_suffix}" if version_suffix else doi
+
+    published = _parse_datetime_or_none(record.get("date"))
+    if published is None:
+        published = _parse_datetime_or_none(record.get("published"))
+    if published is None:
+        return None
+    updated = published
+
+    authors_raw = normalize_text(str(record.get("authors") or ""))
+    if ";" in authors_raw:
+        authors = [normalize_text(item) for item in authors_raw.split(";") if normalize_text(item)]
+    else:
+        authors = [authors_raw] if authors_raw else []
+
+    title = normalize_text(str(record.get("title") or ""))
+    if not title:
+        title = "(untitled)"
+    summary = normalize_text(str(record.get("abstract") or ""))
+
+    category = normalize_text(str(record.get("category") or ""))
+    content_token = f"{doi}{version_suffix}" if version_suffix else doi
+    link_abs = f"https://{host}/content/{content_token}"
+    link_pdf = f"{link_abs}.full.pdf"
+
+    return Paper(
+        index=0,
+        arxiv_id=paper_id,
+        title=title,
+        summary=summary,
+        authors=authors,
+        published=published,
+        updated=updated,
+        published_raw=published.strftime("%Y-%m-%d"),
+        updated_raw=updated.strftime("%Y-%m-%d"),
+        primary_category=category,
+        link_abs=link_abs,
+        link_pdf=link_pdf,
+        source=source,
+    )
+
+
+def fetch_recent_rxiv_papers(
+    source: str,
+    keywords: Sequence[str],
+    hours_back: int,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    source_norm = str(source).casefold()
+    if source_norm not in {SOURCE_BIORXIV, SOURCE_MEDRXIV}:
+        return [], "", 0
+
+    host = f"www.{source_norm}.org"
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(hours=hours_back)
+    # API filtering is day-based; widen window by one day and filter by hour locally.
+    from_date = (cutoff - timedelta(days=1)).date().isoformat()
+    to_date = now_utc.date().isoformat()
+
+    papers: List[Paper] = []
+    seen_refs: set[str] = set()
+    request_urls: List[str] = []
+    raw_count = 0
+    cursor = 0
+
+    while len(papers) < max_results:
+        response = requests.get(
+            f"{RXIV_DETAILS_API_URL}/{source_norm}/{from_date}/{to_date}/{cursor}",
+            timeout=30,
+            headers={"User-Agent": "telegram-arxiv-codex-bot/1.0"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        request_urls.append(response.url)
+
+        collection = payload.get("collection", [])
+        if not isinstance(collection, list) or not collection:
+            break
+
+        raw_count += len(collection)
+        for item in collection:
+            if not isinstance(item, dict):
+                continue
+            paper = _rxiv_record_to_paper(item, source=source_norm, host=host)
+            if paper is None:
+                continue
+            if paper.published < cutoff:
+                continue
+            if not _keywords_match_text(keywords, f"{paper.title}\n{paper.summary}"):
+                continue
+            ref = paper_ref_for(paper)
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            papers.append(paper)
+            if len(papers) >= max_results:
+                break
+
+        message_meta = payload.get("messages", [])
+        total_count = 0
+        if isinstance(message_meta, list) and message_meta and isinstance(message_meta[0], dict):
+            try:
+                total_count = int(message_meta[0].get("count", 0) or 0)
+            except Exception:
+                total_count = 0
+
+        cursor += len(collection)
+        if total_count > 0 and cursor >= total_count:
+            break
+
+    papers.sort(key=lambda paper: paper.published, reverse=True)
+    for idx, paper in enumerate(papers, start=1):
+        paper.index = idx
+
+    request_url = "\n".join(request_urls)
+    return papers, request_url, raw_count
+
+
+def _crossref_item_to_preprint_paper(
+    item: dict[str, Any],
+    *,
+    source: str,
+) -> Optional[Paper]:
+    doi = normalize_text(str(item.get("DOI") or ""))
+    if not doi:
+        return None
+
+    title_list = item.get("title", [])
+    title = ""
+    if isinstance(title_list, list) and title_list:
+        title = normalize_text(str(title_list[0] or ""))
+    if not title:
+        title = "(untitled)"
+
+    abstract_raw = str(item.get("abstract") or "")
+    abstract_clean = html.unescape(abstract_raw)
+    abstract_clean = re.sub(r"<[^>]+>", " ", abstract_clean)
+    summary = normalize_text(abstract_clean)
+
+    authors: List[str] = []
+    for author in item.get("author", []):
+        if not isinstance(author, dict):
+            continue
+        given = normalize_text(str(author.get("given") or ""))
+        family = normalize_text(str(author.get("family") or ""))
+        full = normalize_text(" ".join(part for part in [given, family] if part))
+        if full:
+            authors.append(full)
+
+    published_candidates = [
+        _parse_datetime_or_none(item.get("created", {}).get("date-time") if isinstance(item.get("created"), dict) else None),
+        _parse_datetime_or_none(item.get("published-online", {}).get("date-time") if isinstance(item.get("published-online"), dict) else None),
+        _parse_datetime_or_none(item.get("published-print", {}).get("date-time") if isinstance(item.get("published-print"), dict) else None),
+        _parse_datetime_or_none(item.get("indexed", {}).get("date-time") if isinstance(item.get("indexed"), dict) else None),
+        _parse_crossref_date_parts(item.get("posted")),
+        _parse_crossref_date_parts(item.get("published-online")),
+        _parse_crossref_date_parts(item.get("published-print")),
+        _parse_crossref_date_parts(item.get("issued")),
+    ]
+    published = next((candidate for candidate in published_candidates if candidate is not None), None)
+    if published is None:
+        return None
+
+    updated_candidates = [
+        _parse_datetime_or_none(item.get("updated", {}).get("date-time") if isinstance(item.get("updated"), dict) else None),
+        _parse_datetime_or_none(item.get("indexed", {}).get("date-time") if isinstance(item.get("indexed"), dict) else None),
+        _parse_datetime_or_none(item.get("created", {}).get("date-time") if isinstance(item.get("created"), dict) else None),
+        published,
+    ]
+    updated = next((candidate for candidate in updated_candidates if candidate is not None), published)
+
+    link_abs = normalize_text(str(item.get("URL") or ""))
+    if not link_abs:
+        link_abs = f"https://doi.org/{doi}"
+
+    link_pdf = ""
+    for link in item.get("link", []):
+        if not isinstance(link, dict):
+            continue
+        content_type = normalize_text(str(link.get("content-type") or "")).casefold()
+        url = normalize_text(str(link.get("URL") or ""))
+        if not url:
+            continue
+        if "pdf" in content_type or url.endswith(".pdf"):
+            link_pdf = url
+            break
+
+    category = ""
+    container_titles = item.get("container-title", [])
+    if isinstance(container_titles, list) and container_titles:
+        category = normalize_text(str(container_titles[0] or ""))
+
+    return Paper(
+        index=0,
+        arxiv_id=doi,
+        title=title,
+        summary=summary,
+        authors=authors,
+        published=published,
+        updated=updated,
+        published_raw=published.strftime("%Y-%m-%d"),
+        updated_raw=updated.strftime("%Y-%m-%d"),
+        primary_category=category,
+        link_abs=link_abs,
+        link_pdf=link_pdf,
+        source=source,
+    )
+
+
+def fetch_recent_crossref_preprint_papers(
+    source: str,
+    doi_prefix: str,
+    keywords: Sequence[str],
+    hours_back: int,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(hours=hours_back)
+    from_date = (cutoff - timedelta(days=2)).date().isoformat()
+    to_date = now_utc.date().isoformat()
+
+    rows = max(1, min(100, int(max_results)))
+    cursor = "*"
+    papers: List[Paper] = []
+    seen_refs: set[str] = set()
+    request_urls: List[str] = []
+    raw_count = 0
+
+    # Cursor pagination; keep a hard cap to avoid runaway loops.
+    for _ in range(20):
+        params = {
+            "filter": f"prefix:{doi_prefix},from-created-date:{from_date},until-created-date:{to_date}",
+            "sort": "updated",
+            "order": "desc",
+            "rows": rows,
+            "cursor": cursor,
+            "select": (
+                "DOI,title,abstract,author,created,updated,indexed,"
+                "published-online,published-print,posted,issued,URL,link,container-title"
+            ),
+        }
+        response = requests.get(
+            CROSSREF_WORKS_URL,
+            params=params,
+            timeout=30,
+            headers={"User-Agent": "telegram-arxiv-codex-bot/1.0"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        request_urls.append(response.url)
+
+        message = payload.get("message", {})
+        if not isinstance(message, dict):
+            break
+        items = message.get("items", [])
+        if not isinstance(items, list) or not items:
+            break
+
+        raw_count += len(items)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            paper = _crossref_item_to_preprint_paper(item, source=source)
+            if paper is None:
+                continue
+            recency = max(paper.published, paper.updated)
+            if recency < cutoff:
+                continue
+            if not _keywords_match_text(keywords, f"{paper.title}\n{paper.summary}"):
+                continue
+            ref = paper_ref_for(paper)
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            papers.append(paper)
+            if len(papers) >= max_results:
+                break
+
+        if len(papers) >= max_results:
+            break
+        next_cursor = normalize_text(str(message.get("next-cursor") or ""))
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
+    papers.sort(key=lambda paper: max(paper.published, paper.updated), reverse=True)
+    for idx, paper in enumerate(papers, start=1):
+        paper.index = idx
+
+    request_url = "\n".join(request_urls)
+    return papers, request_url, raw_count
+
+
+def fetch_recent_chemrxiv_papers(
+    keywords: Sequence[str],
+    hours_back: int,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    return fetch_recent_crossref_preprint_papers(
+        source=SOURCE_CHEMRXIV,
+        doi_prefix="10.26434",
+        keywords=keywords,
+        hours_back=hours_back,
+        max_results=max_results,
+    )
+
+
+def _openalex_abstract_from_inverted_index(raw: Any) -> str:
+    if not isinstance(raw, dict) or not raw:
+        return ""
+    max_pos = -1
+    for positions in raw.values():
+        if not isinstance(positions, list):
+            continue
+        for pos in positions:
+            if isinstance(pos, int) and pos > max_pos:
+                max_pos = pos
+    if max_pos < 0:
+        return ""
+    tokens = [""] * (max_pos + 1)
+    for word, positions in raw.items():
+        if not isinstance(word, str) or not isinstance(positions, list):
+            continue
+        for pos in positions:
+            if isinstance(pos, int) and 0 <= pos < len(tokens) and not tokens[pos]:
+                tokens[pos] = word
+    return normalize_text(" ".join(token for token in tokens if token))
+
+
+def _openalex_item_to_preprint_paper(item: dict[str, Any], *, source: str) -> Optional[Paper]:
+    doi_raw = normalize_text(str(item.get("doi") or ""))
+    doi = doi_raw.removeprefix("https://doi.org/").removeprefix("http://doi.org/")
+    doi = normalize_text(doi).strip()
+    if not doi:
+        return None
+
+    title = normalize_text(str(item.get("title") or "")) or "(untitled)"
+    summary = _openalex_abstract_from_inverted_index(item.get("abstract_inverted_index"))
+
+    authors: List[str] = []
+    for authorship in item.get("authorships", []):
+        if not isinstance(authorship, dict):
+            continue
+        author = authorship.get("author")
+        if not isinstance(author, dict):
+            continue
+        display_name = normalize_text(str(author.get("display_name") or ""))
+        if display_name:
+            authors.append(display_name)
+
+    # For user-facing "last N hours" windows we must use the real publication
+    # date, not indexing/creation timestamps that can shift much later.
+    published = _parse_datetime_or_none(item.get("publication_date"))
+    if published is None:
+        return None
+    updated = _parse_datetime_or_none(item.get("updated_date")) or published
+
+    primary_location = item.get("primary_location")
+    best_oa_location = item.get("best_oa_location")
+    link_pdf = ""
+    if isinstance(primary_location, dict):
+        link_pdf = normalize_text(str(primary_location.get("pdf_url") or ""))
+    if not link_pdf and isinstance(best_oa_location, dict):
+        link_pdf = normalize_text(str(best_oa_location.get("pdf_url") or ""))
+
+    link_abs = normalize_text(str(item.get("id") or ""))
+    if not link_abs:
+        link_abs = f"https://doi.org/{doi}"
+
+    category = ""
+    primary_topic = item.get("primary_topic")
+    if isinstance(primary_topic, dict):
+        category = normalize_text(str(primary_topic.get("display_name") or ""))
+    if not category and isinstance(primary_location, dict):
+        source_node = primary_location.get("source")
+        if isinstance(source_node, dict):
+            category = normalize_text(str(source_node.get("display_name") or ""))
+
+    return Paper(
+        index=0,
+        arxiv_id=doi,
+        title=title,
+        summary=summary,
+        authors=authors,
+        published=published,
+        updated=updated,
+        published_raw=published.strftime("%Y-%m-%d"),
+        updated_raw=updated.strftime("%Y-%m-%d"),
+        primary_category=category,
+        link_abs=link_abs,
+        link_pdf=link_pdf,
+        source=source,
+    )
+
+
+def _keywords_to_openalex_search_query(keywords: Sequence[str]) -> str:
+    terms: List[str] = []
+    seen: set[str] = set()
+    for keyword in keywords:
+        for part in str(keyword).split("+"):
+            cleaned = normalize_text(part).strip('"').strip("'").strip()
+            if not cleaned:
+                continue
+            key = cleaned.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            terms.append(cleaned)
+    return " ".join(terms)
+
+
+def fetch_recent_ssrn_papers_openalex(
+    keywords: Sequence[str],
+    hours_back: int,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(hours=hours_back)
+
+    rows = max(1, min(200, int(max_results)))
+    cursor = "*"
+    papers: List[Paper] = []
+    seen_refs: set[str] = set()
+    request_urls: List[str] = []
+    raw_count = 0
+    search_query = _keywords_to_openalex_search_query(keywords)
+
+    def _ssrn_window_timestamp(paper: Paper) -> datetime:
+        return _paper_recency_timestamp(paper, prefer_updated_for_arxiv=False)
+
+    # Cursor pagination; keep a hard cap to avoid runaway loops.
+    for _ in range(20):
+        params: dict[str, Any] = {
+            "filter": "doi_starts_with:10.2139",
+            "per-page": rows,
+            "cursor": cursor,
+            "sort": "publication_date:desc",
+        }
+        if search_query:
+            params["search"] = search_query
+
+        openalex_mailto = normalize_text(os.getenv("OPENALEX_MAILTO", ""))
+        if openalex_mailto:
+            params["mailto"] = openalex_mailto
+
+        response: Optional[requests.Response] = None
+        for attempt in range(3):
+            candidate = requests.get(
+                OPENALEX_WORKS_URL,
+                params=params,
+                timeout=30,
+                headers={"User-Agent": "telegram-arxiv-codex-bot/1.0"},
+            )
+            if candidate.status_code != 429:
+                response = candidate
+                break
+            # Respect rate limiting with a small exponential backoff.
+            wait_seconds = 2 * (attempt + 1)
+            logger.warning("OpenAlex rate-limited request. Retrying in %ss.", wait_seconds)
+            systime.sleep(wait_seconds)
+            response = candidate
+
+        if response is None:
+            break
+        response.raise_for_status()
+        payload = response.json()
+        request_urls.append(response.url)
+
+        items = payload.get("results", [])
+        if not isinstance(items, list) or not items:
+            break
+
+        raw_count += len(items)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            paper = _openalex_item_to_preprint_paper(item, source=SOURCE_SSRN)
+            if paper is None:
+                continue
+            if not paper.arxiv_id.casefold().startswith("10.2139/"):
+                continue
+
+            if _ssrn_window_timestamp(paper) < cutoff:
+                continue
+            if not _keywords_match_text(keywords, f"{paper.title}\n{paper.summary}"):
+                continue
+            ref = paper_ref_for(paper)
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            papers.append(paper)
+            if len(papers) >= max_results:
+                break
+
+        if len(papers) >= max_results:
+            break
+
+        meta = payload.get("meta", {})
+        if not isinstance(meta, dict):
+            break
+        next_cursor = normalize_text(str(meta.get("next_cursor") or ""))
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
+    papers.sort(key=_ssrn_window_timestamp, reverse=True)
+    for idx, paper in enumerate(papers, start=1):
+        paper.index = idx
+
+    request_url = "\n".join(request_urls)
+    return papers, request_url, raw_count
+
+
+def fetch_recent_ssrn_papers(
+    keywords: Sequence[str],
+    hours_back: int,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    # SSRN is fetched only via OpenAlex (no Crossref fallback).
+    return fetch_recent_ssrn_papers_openalex(
+        keywords=keywords,
+        hours_back=hours_back,
+        max_results=max_results,
+    )
 
 
 def _pubmed_month_to_int(raw: str) -> int:
@@ -1393,6 +2077,15 @@ def _paper_recency_timestamp(
     """Return the timestamp used to order paper results in user-facing views."""
     if prefer_updated_for_arxiv and paper.source.casefold() == SOURCE_ARXIV:
         return paper.updated
+    if (
+        paper.source.casefold() == SOURCE_SSRN
+        and paper.updated > paper.published
+        and paper.published.month == 1
+        and paper.published.day == 1
+    ):
+        # OpenAlex often exposes SSRN publication_date as YYYY-01-01 placeholders.
+        # In that case, updated_date better represents new/ingested items.
+        return paper.updated
     return paper.published
 
 
@@ -1458,6 +2151,7 @@ async def fetch_papers_by_refs(paper_refs: Sequence[str]) -> tuple[List[Paper], 
 
     arxiv_ids: List[str] = []
     pubmed_ids: List[str] = []
+    unsupported_refs: List[str] = []
     parsed_refs: List[tuple[str, str, str]] = []
     for raw_ref in normalized_refs:
         parsed = parse_paper_ref(raw_ref)
@@ -1468,8 +2162,10 @@ async def fetch_papers_by_refs(paper_refs: Sequence[str]) -> tuple[List[Paper], 
         parsed_refs.append((canonical_ref, source, paper_id))
         if source == SOURCE_PUBMED:
             pubmed_ids.append(paper_id)
-        else:
+        elif source == SOURCE_ARXIV:
             arxiv_ids.append(paper_id)
+        else:
+            unsupported_refs.append(canonical_ref)
 
     arxiv_papers, arxiv_missing = await fetch_papers_by_arxiv_ids(arxiv_ids)
     pubmed_papers, pubmed_missing = await fetch_papers_by_pubmed_ids(pubmed_ids)
@@ -1481,11 +2177,12 @@ async def fetch_papers_by_refs(paper_refs: Sequence[str]) -> tuple[List[Paper], 
         resolved[make_paper_ref(SOURCE_PUBMED, paper.arxiv_id)] = paper
 
     ordered: List[Paper] = []
-    missing: List[str] = []
+    missing: List[str] = list(unsupported_refs)
     for idx, (canonical_ref, _source, _paper_id) in enumerate(parsed_refs, start=1):
         paper = resolved.get(canonical_ref)
         if paper is None:
-            missing.append(canonical_ref)
+            if canonical_ref not in missing:
+                missing.append(canonical_ref)
             continue
         paper.index = idx
         ordered.append(paper)
@@ -1761,13 +2458,24 @@ async def refresh_cache(
     )
     effective_hours_back = int(hours_back) if hours_back is not None else cached_hours_back
     keywords_by_source = get_keywords_by_source(user_data=user_data, user_id=user_id)
-    arxiv_keywords = keywords_by_source[SOURCE_ARXIV]
-    pubmed_keywords = keywords_by_source[SOURCE_PUBMED]
+    arxiv_keywords = keywords_by_source.get(SOURCE_ARXIV, [])
+    biorxiv_keywords = keywords_by_source.get(SOURCE_BIORXIV, [])
+    medrxiv_keywords = keywords_by_source.get(SOURCE_MEDRXIV, [])
+    chemrxiv_keywords = keywords_by_source.get(SOURCE_CHEMRXIV, [])
+    pubmed_keywords = keywords_by_source.get(SOURCE_PUBMED, [])
 
     arxiv_query = build_arxiv_query(keywords=arxiv_keywords)
     pubmed_query = build_pubmed_query(keywords=pubmed_keywords)
+    has_preprint_queries = any(
+        [
+            arxiv_query,
+            biorxiv_keywords,
+            medrxiv_keywords,
+            chemrxiv_keywords,
+        ]
+    )
 
-    if not arxiv_query and not pubmed_query:
+    if not has_preprint_queries and not pubmed_query:
         user_data["papers"] = []
         user_data["last_query"] = ""
         user_data["last_request_url"] = ""
@@ -1779,32 +2487,111 @@ async def refresh_cache(
         return []
 
     logger.info(
-        "Refreshing paper cache for user %s (arXiv=%s, PubMed=%s)",
+        (
+            "Refreshing paper cache for user %s "
+            "(arXiv=%s, bioRxiv=%s, medRxiv=%s, ChemRxiv=%s, PubMed=%s)"
+        ),
         user_id,
         bool(arxiv_query),
+        bool(biorxiv_keywords),
+        bool(medrxiv_keywords),
+        bool(chemrxiv_keywords),
         bool(pubmed_query),
     )
 
     arxiv_papers: List[Paper] = []
     arxiv_request_url = ""
     arxiv_raw_count = 0
+    biorxiv_papers: List[Paper] = []
+    biorxiv_request_url = ""
+    biorxiv_raw_count = 0
+    medrxiv_papers: List[Paper] = []
+    medrxiv_request_url = ""
+    medrxiv_raw_count = 0
+    chemrxiv_papers: List[Paper] = []
+    chemrxiv_request_url = ""
+    chemrxiv_raw_count = 0
+    preprint_fetches: List[tuple[str, Any]] = []
     if arxiv_query:
-        entries, arxiv_request_url = await asyncio.to_thread(
-            fetch_arxiv_entries,
-            arxiv_query,
-            DEFAULT_MAX_RESULTS,
-            "lastUpdatedDate" if effective_scope == SEARCH_SCOPE_TODAY else "submittedDate",
-        )
-        arxiv_raw_count = len(entries)
-        if effective_scope == SEARCH_SCOPE_TODAY:
-            arxiv_papers = entries_to_recent_papers(
-                entries,
-                TODAY_HOURS_BACK,
-                use_updated=True,
+        preprint_fetches.append(
+            (
+                SOURCE_ARXIV,
+                asyncio.to_thread(
+                    fetch_arxiv_entries,
+                    arxiv_query,
+                    DEFAULT_MAX_RESULTS,
+                    "lastUpdatedDate" if effective_scope == SEARCH_SCOPE_TODAY else "submittedDate",
+                ),
             )
-        else:
-            arxiv_papers = entries_to_recent_papers(entries, effective_hours_back)
-
+        )
+    if biorxiv_keywords:
+        preprint_fetches.append(
+            (
+                SOURCE_BIORXIV,
+                asyncio.to_thread(
+                    fetch_recent_rxiv_papers,
+                    SOURCE_BIORXIV,
+                    biorxiv_keywords,
+                    effective_hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if medrxiv_keywords:
+        preprint_fetches.append(
+            (
+                SOURCE_MEDRXIV,
+                asyncio.to_thread(
+                    fetch_recent_rxiv_papers,
+                    SOURCE_MEDRXIV,
+                    medrxiv_keywords,
+                    effective_hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if chemrxiv_keywords:
+        preprint_fetches.append(
+            (
+                SOURCE_CHEMRXIV,
+                asyncio.to_thread(
+                    fetch_recent_chemrxiv_papers,
+                    chemrxiv_keywords,
+                    effective_hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if preprint_fetches:
+        preprint_results = await asyncio.gather(
+            *(task for _source, task in preprint_fetches),
+            return_exceptions=True,
+        )
+        for (source, _task), result in zip(preprint_fetches, preprint_results):
+            if isinstance(result, Exception):
+                logger.warning("%s fetch failed: %s", paper_source_label(source), result)
+                continue
+            if source == SOURCE_ARXIV:
+                entries, arxiv_request_url = result
+                arxiv_raw_count = len(entries)
+                if effective_scope == SEARCH_SCOPE_TODAY:
+                    arxiv_papers = entries_to_recent_papers(
+                        entries,
+                        TODAY_HOURS_BACK,
+                        use_updated=True,
+                    )
+                else:
+                    arxiv_papers = entries_to_recent_papers(entries, effective_hours_back)
+                continue
+            if source == SOURCE_BIORXIV:
+                biorxiv_papers, biorxiv_request_url, biorxiv_raw_count = result
+                continue
+            if source == SOURCE_MEDRXIV:
+                medrxiv_papers, medrxiv_request_url, medrxiv_raw_count = result
+                continue
+            if source == SOURCE_CHEMRXIV:
+                chemrxiv_papers, chemrxiv_request_url, chemrxiv_raw_count = result
+                continue
     pubmed_papers: List[Paper] = []
     pubmed_request_url = ""
     pubmed_raw_count = 0
@@ -1816,7 +2603,7 @@ async def refresh_cache(
             DEFAULT_MAX_RESULTS,
         )
 
-    papers = arxiv_papers + pubmed_papers
+    papers = arxiv_papers + biorxiv_papers + medrxiv_papers + chemrxiv_papers + pubmed_papers
     papers.sort(
         key=lambda paper: _paper_recency_timestamp(
             paper,
@@ -1830,20 +2617,41 @@ async def refresh_cache(
     query_lines: List[str] = []
     if arxiv_query:
         query_lines.append(f"arXiv: {arxiv_query}")
+    if biorxiv_keywords:
+        query_lines.append(f"bioRxiv keywords: {', '.join(biorxiv_keywords)}")
+    if medrxiv_keywords:
+        query_lines.append(f"medRxiv keywords: {', '.join(medrxiv_keywords)}")
+    if chemrxiv_keywords:
+        query_lines.append(f"ChemRxiv keywords: {', '.join(chemrxiv_keywords)}")
     if pubmed_query:
         query_lines.append(f"PubMed: {pubmed_query}")
 
     request_lines: List[str] = []
     if arxiv_request_url:
         request_lines.append(f"arXiv: {arxiv_request_url}")
+    if biorxiv_request_url:
+        request_lines.append(f"bioRxiv: {biorxiv_request_url}")
+    if medrxiv_request_url:
+        request_lines.append(f"medRxiv: {medrxiv_request_url}")
+    if chemrxiv_request_url:
+        request_lines.append(f"ChemRxiv: {chemrxiv_request_url}")
     if pubmed_request_url:
         request_lines.append(f"PubMed: {pubmed_request_url}")
 
     raw_breakdown = {
         "arxiv": arxiv_raw_count,
+        "biorxiv": biorxiv_raw_count,
+        "medrxiv": medrxiv_raw_count,
+        "chemrxiv": chemrxiv_raw_count,
         "pubmed": pubmed_raw_count,
     }
-    raw_total = arxiv_raw_count + pubmed_raw_count
+    raw_total = (
+        arxiv_raw_count
+        + biorxiv_raw_count
+        + medrxiv_raw_count
+        + chemrxiv_raw_count
+        + pubmed_raw_count
+    )
 
     user_data["papers"] = papers
     user_data["last_query"] = "\n".join(query_lines)
@@ -1862,24 +2670,105 @@ async def fetch_recent_papers_for_user(
     hours_back: int,
 ) -> tuple[list[Paper], str, int, dict[str, int]]:
     arxiv_keywords = get_keywords_for_source(SOURCE_ARXIV, user_id=user_id)
+    biorxiv_keywords = get_keywords_for_source(SOURCE_BIORXIV, user_id=user_id)
+    medrxiv_keywords = get_keywords_for_source(SOURCE_MEDRXIV, user_id=user_id)
+    chemrxiv_keywords = get_keywords_for_source(SOURCE_CHEMRXIV, user_id=user_id)
     pubmed_keywords = get_keywords_for_pubmed(user_id=user_id)
     arxiv_query = build_arxiv_query(keywords=arxiv_keywords)
     pubmed_query = build_pubmed_query(keywords=pubmed_keywords)
-    if not arxiv_query and not pubmed_query:
+    has_preprint_queries = any(
+        [
+            arxiv_query,
+            biorxiv_keywords,
+            medrxiv_keywords,
+            chemrxiv_keywords,
+        ]
+    )
+    if not has_preprint_queries and not pubmed_query:
         return [], "", 0, {}
 
     arxiv_papers: List[Paper] = []
     arxiv_raw = 0
+    biorxiv_papers: List[Paper] = []
+    biorxiv_raw = 0
+    medrxiv_papers: List[Paper] = []
+    medrxiv_raw = 0
+    chemrxiv_papers: List[Paper] = []
+    chemrxiv_raw = 0
+    preprint_fetches: List[tuple[str, Any]] = []
     if arxiv_query:
-        entries, _arxiv_url = await asyncio.to_thread(
-            fetch_arxiv_entries,
-            arxiv_query,
-            DEFAULT_MAX_RESULTS,
-            "lastUpdatedDate",
+        preprint_fetches.append(
+            (
+                SOURCE_ARXIV,
+                asyncio.to_thread(
+                    fetch_arxiv_entries,
+                    arxiv_query,
+                    DEFAULT_MAX_RESULTS,
+                    "lastUpdatedDate",
+                ),
+            )
         )
-        arxiv_raw = len(entries)
-        arxiv_papers = entries_to_recent_papers(entries, hours_back, use_updated=True)
-
+    if biorxiv_keywords:
+        preprint_fetches.append(
+            (
+                SOURCE_BIORXIV,
+                asyncio.to_thread(
+                    fetch_recent_rxiv_papers,
+                    SOURCE_BIORXIV,
+                    biorxiv_keywords,
+                    hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if medrxiv_keywords:
+        preprint_fetches.append(
+            (
+                SOURCE_MEDRXIV,
+                asyncio.to_thread(
+                    fetch_recent_rxiv_papers,
+                    SOURCE_MEDRXIV,
+                    medrxiv_keywords,
+                    hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if chemrxiv_keywords:
+        preprint_fetches.append(
+            (
+                SOURCE_CHEMRXIV,
+                asyncio.to_thread(
+                    fetch_recent_chemrxiv_papers,
+                    chemrxiv_keywords,
+                    hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if preprint_fetches:
+        preprint_results = await asyncio.gather(
+            *(task for _source, task in preprint_fetches),
+            return_exceptions=True,
+        )
+        for (source, _task), result in zip(preprint_fetches, preprint_results):
+            if isinstance(result, Exception):
+                logger.warning("%s fetch failed for recap: %s", paper_source_label(source), result)
+                continue
+            if source == SOURCE_ARXIV:
+                entries, _arxiv_url = result
+                arxiv_raw = len(entries)
+                arxiv_papers = entries_to_recent_papers(entries, hours_back, use_updated=True)
+                continue
+            if source == SOURCE_BIORXIV:
+                biorxiv_papers, _biorxiv_url, biorxiv_raw = result
+                continue
+            if source == SOURCE_MEDRXIV:
+                medrxiv_papers, _medrxiv_url, medrxiv_raw = result
+                continue
+            if source == SOURCE_CHEMRXIV:
+                chemrxiv_papers, _chemrxiv_url, chemrxiv_raw = result
+                continue
     pubmed_papers: List[Paper] = []
     pubmed_raw = 0
     if pubmed_query:
@@ -1890,7 +2779,7 @@ async def fetch_recent_papers_for_user(
             DEFAULT_MAX_RESULTS,
         )
 
-    papers = arxiv_papers + pubmed_papers
+    papers = arxiv_papers + biorxiv_papers + medrxiv_papers + chemrxiv_papers + pubmed_papers
     papers.sort(
         key=lambda paper: _paper_recency_timestamp(paper, prefer_updated_for_arxiv=True),
         reverse=True,
@@ -1901,11 +2790,24 @@ async def fetch_recent_papers_for_user(
     query_lines: List[str] = []
     if arxiv_query:
         query_lines.append(f"arXiv: {arxiv_query}")
+    if biorxiv_keywords:
+        query_lines.append(f"bioRxiv keywords: {', '.join(biorxiv_keywords)}")
+    if medrxiv_keywords:
+        query_lines.append(f"medRxiv keywords: {', '.join(medrxiv_keywords)}")
+    if chemrxiv_keywords:
+        query_lines.append(f"ChemRxiv keywords: {', '.join(chemrxiv_keywords)}")
     if pubmed_query:
         query_lines.append(f"PubMed: {pubmed_query}")
 
-    raw_breakdown = {"arxiv": arxiv_raw, "pubmed": pubmed_raw}
-    return papers, "\n".join(query_lines), arxiv_raw + pubmed_raw, raw_breakdown
+    raw_breakdown = {
+        "arxiv": arxiv_raw,
+        "biorxiv": biorxiv_raw,
+        "medrxiv": medrxiv_raw,
+        "chemrxiv": chemrxiv_raw,
+        "pubmed": pubmed_raw,
+    }
+    raw_total = arxiv_raw + biorxiv_raw + medrxiv_raw + chemrxiv_raw + pubmed_raw
+    return papers, "\n".join(query_lines), raw_total, raw_breakdown
 
 
 async def send_daily_recap_for_user(
@@ -1958,7 +2860,16 @@ async def send_daily_recap_for_user(
         )
         return
 
-    shown = min(len(papers), MAX_DAILY_RECAP_ITEMS)
+    user_data = application.user_data[user_id]
+    user_data["papers"] = papers
+    user_data["last_query"] = query
+    user_data["last_raw_entry_count"] = raw_count
+    user_data["last_raw_entry_breakdown"] = raw_breakdown
+    user_data["cache_hours_back"] = DAILY_RECAP_HOURS
+    user_data["cache_scope"] = SEARCH_SCOPE_TODAY
+    user_data["results_token"] = int(user_data.get("results_token", 0) or 0) + 1
+    results_token = int(user_data["results_token"])
+
     await application.bot.send_message(
         chat_id=chat_id,
         text=(
@@ -1968,24 +2879,31 @@ async def send_daily_recap_for_user(
         reply_markup=build_main_menu_markup(),
     )
 
-    for paper in papers[:shown]:
+    async def send_recap_text(
+        text: str,
+        *,
+        reply_markup: Optional[Any] = None,
+        parse_mode: Optional[str] = None,
+        disable_web_page_preview: Optional[bool] = None,
+    ) -> None:
         await application.bot.send_message(
             chat_id=chat_id,
-            text=format_paper_line(paper, prefer_updated_for_arxiv=True),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=build_paper_reply_markup(paper),
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
         )
 
-    if len(papers) > shown:
-        await application.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"Showing {shown} of {len(papers)} recap items. "
-                f"Open {MENU_BTN_TODAY} to see the full current list."
-            ),
-            reply_markup=build_main_menu_markup(),
-        )
+    await send_results_page(
+        send_recap_text,
+        context=SimpleNamespace(user_data=user_data),
+        papers=papers,
+        user_id=user_id,
+        hours_back=DAILY_RECAP_HOURS,
+        scope=SEARCH_SCOPE_TODAY,
+        results_token=results_token,
+        start_index=0,
+    )
 
 
 async def daily_recap_job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2038,10 +2956,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_first_open:
         welcome_text = (
             "<b>Welcome to dailyArXiv</b>\n\n"
-            "Track new papers from arXiv and PubMed using your own keywords.\n\n"
+            "Track new papers from arXiv, bioRxiv, medRxiv, ChemRxiv, and PubMed using your own keywords.\n\n"
             "<b>Initial Setup (do this first)</b>\n"
-            f"1. Add keywords with <b>{html.escape(MENU_BTN_ADD_ARXIV_KEYWORD)}</b> and "
-            f"<b>{html.escape(MENU_BTN_ADD_PUBMED_KEYWORD)}</b>\n"
+            f"1. Open <b>{html.escape(MENU_BTN_ADD_KEYWORDS)}</b>, then choose a source (or All sources)\n"
             f"2. Check results with <b>{html.escape(MENU_BTN_TODAY)}</b> "
             f"(last {TODAY_HOURS_BACK}h) or <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b>\n\n"
             "<b>Set Up Recap</b>\n"
@@ -2078,24 +2995,21 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def build_help_text() -> str:
     return (
         "<b>Initial Setup</b>\n"
-        f"1. Add your first keywords with <b>{html.escape(MENU_BTN_ADD_ARXIV_KEYWORD)}</b> and "
-        f"<b>{html.escape(MENU_BTN_ADD_PUBMED_KEYWORD)}</b>\n"
+        f"1. Add your first keywords with <b>{html.escape(MENU_BTN_ADD_KEYWORDS)}</b> "
+        "(choose source or All sources)\n"
         f"2. Run your first search with <b>{html.escape(MENU_BTN_TODAY)}</b> or "
         f"<b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b>\n"
         f"3. Configure automatic updates with <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b> and "
         f"<b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>\n\n"
         "<b>Search & Results</b>\n"
-        f"• <b>{html.escape(MENU_BTN_TODAY)}</b>: show the last {TODAY_HOURS_BACK} hours on arXiv and PubMed\n"
+        f"• <b>{html.escape(MENU_BTN_TODAY)}</b>: show the last {TODAY_HOURS_BACK} hours on arXiv, bioRxiv, medRxiv, ChemRxiv, and PubMed\n"
         f"• <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b>: choose a custom time range\n"
         f"• <b>{html.escape(MENU_BTN_KEYWORDS)}</b>: show your current keyword lists\n"
         f"• <b>{html.escape(MENU_BTN_BOOKMARKS)}</b>: show saved papers\n\n"
         "<b>Keyword Management</b>\n"
-        f"• <b>{html.escape(MENU_BTN_ADD_ARXIV_KEYWORD)}</b>: add arXiv keywords\n"
-        f"• <b>{html.escape(MENU_BTN_REMOVE_ARXIV_KEYWORD)}</b>: remove arXiv keywords\n"
-        f"• <b>{html.escape(MENU_BTN_CLEAR_ARXIV_KEYWORD)}</b>: clear all arXiv keywords\n"
-        f"• <b>{html.escape(MENU_BTN_ADD_PUBMED_KEYWORD)}</b>: add PubMed keywords\n"
-        f"• <b>{html.escape(MENU_BTN_REMOVE_PUBMED_KEYWORD)}</b>: remove PubMed keywords\n"
-        f"• <b>{html.escape(MENU_BTN_CLEAR_PUBMED_KEYWORD)}</b>: clear all PubMed keywords\n\n"
+        f"• <b>{html.escape(MENU_BTN_ADD_KEYWORDS)}</b>: add keywords for one source or all sources\n"
+        f"• <b>{html.escape(MENU_BTN_REMOVE_KEYWORDS)}</b>: remove keywords for one source or all sources\n"
+        f"• <b>{html.escape(MENU_BTN_CLEAR_KEYWORDS)}</b>: clear keywords for one source or all sources\n\n"
         "<b>Recap</b>\n"
         f"• <b>{html.escape(MENU_BTN_DAILY_RECAP)}</b>: turn the recap on or off\n"
         f"• <b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>: choose time zone and set one or more local recap times (HH:MM)\n"
@@ -2256,36 +3170,27 @@ async def setreporttarget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def keywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = _get_user_id(update)
-    arxiv_keywords = get_keywords_for_source(
-        SOURCE_ARXIV,
-        context.user_data,
-        user_id=user_id,
-    )
-    pubmed_keywords = get_keywords_for_pubmed(
-        context.user_data,
-        user_id=user_id,
-    )
-    arxiv_body = (
-        "\n".join(f"- {html.escape(k)}" for k in arxiv_keywords)
-        if arxiv_keywords
-        else "(none)"
-    )
-    pubmed_body = (
-        "\n".join(f"- {html.escape(k)}" for k in pubmed_keywords)
-        if pubmed_keywords
-        else "(none)"
-    )
+    keywords_by_source = get_keywords_by_source(context.user_data, user_id=user_id)
+    sections: List[str] = []
+    for source in keyword_sources():
+        source_keywords = keywords_by_source.get(source, [])
+        source_body = (
+            "\n".join(f"- {html.escape(item)}" for item in source_keywords)
+            if source_keywords
+            else "(none)"
+        )
+        sections.append(
+            f"<b>{html.escape(paper_source_label(source))}</b>\n"
+            f"<pre>{source_body}</pre>"
+        )
 
     if update.message:
         await update.message.reply_text(
             "<b>Active Keywords</b>\n\n"
             f"<b>{html.escape(MENU_BTN_TODAY)} Window</b>\n"
-            f"arXiv: last {TODAY_HOURS_BACK} hours (by last update)\n"
-            f"PubMed: last {TODAY_HOURS_BACK} hours\n\n"
-            "<b>arXiv</b>\n"
-            f"<pre>{arxiv_body}</pre>\n\n"
-            "<b>PubMed</b>\n"
-            f"<pre>{pubmed_body}</pre>\n\n"
+            f"All sources: last {TODAY_HOURS_BACK} hours\n\n"
+            + "\n\n".join(sections)
+            + "\n\n"
             f"Use <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a different time range.\n"
             "Use commas for separate alternatives (OR). Use <code>+</code> to search terms together (AND) in one entry.\n"
             'e.g. <code>"quantum mechanics" + entanglement, superconductivity</code>.',
@@ -2312,11 +3217,13 @@ async def prompt_setkeywords_input(update: Update, context: ContextTypes.DEFAULT
     if update.message:
         await update.message.reply_text(
             "<b>Set Keywords</b>\n\n"
-            "Send a comma-separated list for both sources.\n"
+            "Send a comma-separated list to apply to all sources.\n"
             "Use <code>+</code> inside one entry to search terms together (AND), not separately.\n\n"
             "<b>Example</b>\n"
             "<code>astronomy, climate change + photosynthesis</code>\n\n"
-            "To edit one source only, use the source-specific buttons.",
+            f"To edit one source only, use <b>{html.escape(MENU_BTN_ADD_KEYWORDS)}</b> / "
+            f"<b>{html.escape(MENU_BTN_REMOVE_KEYWORDS)}</b> / "
+            f"<b>{html.escape(MENU_BTN_CLEAR_KEYWORDS)}</b>.",
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
         )
@@ -2329,20 +3236,72 @@ async def prompt_add_keyword_for_source(
 ) -> None:
     _clear_pending_input_flags(context)
     context.user_data["awaiting_add_keyword_source"] = source
-    source_label = paper_source_label(source)
+    source_label = keyword_source_label(source)
+    text = (
+        f"<b>Add Keywords • {html.escape(source_label)}</b>\n\n"
+        "Send one or more keywords.\n"
+        "Separate entries with commas.\n\n"
+        "Use <code>+</code> inside one entry to search terms together (AND), not separately.\n\n"
+        "<b>Examples</b>\n"
+        "<code>quantum mechanics</code>\n"
+        "<code>astronomy, climate change + photosynthesis</code>\n"
+        "<code>\"quantum mechanics\" + entanglement</code>"
+    )
     if update.message:
         await update.message.reply_text(
-            f"<b>Add Keywords • {html.escape(source_label)}</b>\n\n"
-            "Send one or more keywords.\n"
-            "Separate entries with commas.\n\n"
-            "Use <code>+</code> inside one entry to search terms together (AND), not separately.\n\n"
-            "<b>Examples</b>\n"
-            "<code>quantum mechanics</code>\n"
-            "<code>astronomy, climate change + photosynthesis</code>\n"
-            "<code>\"quantum mechanics\" + entanglement</code>",
+            text,
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
         )
+        return
+    chat = update.effective_chat
+    if chat is not None:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def prompt_keyword_scope_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+) -> None:
+    _clear_pending_input_flags(context)
+    action_label = _keyword_action_label(action)
+    text = (
+        f"<b>{html.escape(action_label)}</b>\n\n"
+        "Choose where this action should apply."
+    )
+    if update.message is not None:
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_keyword_scope_markup(action),
+        )
+        return
+    chat = update.effective_chat
+    if chat is not None:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_keyword_scope_markup(action),
+        )
+
+
+async def prompt_add_keywords_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await prompt_keyword_scope_menu(update, context, "add")
+
+
+async def prompt_remove_keywords_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await prompt_keyword_scope_menu(update, context, "remove")
+
+
+async def prompt_clear_keywords_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await prompt_keyword_scope_menu(update, context, "clear")
 
 
 async def prompt_remove_keyword_for_source(
@@ -2352,48 +3311,44 @@ async def prompt_remove_keyword_for_source(
 ) -> None:
     _clear_pending_input_flags(context)
     context.user_data["awaiting_remove_keyword_source"] = source
-    source_label = paper_source_label(source)
+    source_label = keyword_source_label(source)
     user_id = _get_user_id(update)
-    current = get_keywords_for_source(source, context.user_data, user_id=user_id)
+    if source == KEYWORD_SCOPE_ALL:
+        all_current = [
+            f"[{paper_source_label(item_source)}] {keyword}"
+            for item_source in keyword_sources()
+            for keyword in get_keywords_for_source(item_source, context.user_data, user_id=user_id)
+        ]
+        current = all_current
+    else:
+        current = get_keywords_for_source(source, context.user_data, user_id=user_id)
     body = "\n".join(f"- {k}" for k in current) if current else "(none)"
     body_html = html.escape(body)
+    text = (
+        f"<b>Remove Keywords • {html.escape(source_label)}</b>\n\n"
+        "Send one or more saved keywords to remove.\n"
+        "Separate entries with commas.\n\n"
+        "<b>Current Keywords</b>\n"
+        f"<pre>{body_html}</pre>\n"
+        "<b>Examples</b>\n"
+        "<code>astronomy</code>\n"
+        "<code>astronomy, photosynthesis</code>"
+    )
     if update.message:
         await update.message.reply_text(
-            f"<b>Remove Keywords • {html.escape(source_label)}</b>\n\n"
-            "Send one or more saved keywords to remove.\n"
-            "Separate entries with commas.\n\n"
-            "<b>Current Keywords</b>\n"
-            f"<pre>{body_html}</pre>\n"
-            "<b>Examples</b>\n"
-            "<code>astronomy</code>\n"
-            "<code>astronomy, photosynthesis</code>",
+            text,
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
         )
-
-
-async def prompt_add_arxiv_keyword_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await prompt_add_keyword_for_source(update, context, SOURCE_ARXIV)
-
-
-async def prompt_remove_arxiv_keyword_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await prompt_remove_keyword_for_source(update, context, SOURCE_ARXIV)
-
-
-async def prompt_add_pubmed_keyword_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await prompt_add_keyword_for_source(update, context, SOURCE_PUBMED)
-
-
-async def prompt_remove_pubmed_keyword_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await prompt_remove_keyword_for_source(update, context, SOURCE_PUBMED)
-
-
-async def clear_arxiv_keywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await clear_keywords_for_source(update, context, SOURCE_ARXIV)
-
-
-async def clear_pubmed_keywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await clear_keywords_for_source(update, context, SOURCE_PUBMED)
+        return
+    chat = update.effective_chat
+    if chat is not None:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
+        )
 
 
 async def prompt_searchhours_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2401,8 +3356,8 @@ async def prompt_searchhours_input(update: Update, context: ContextTypes.DEFAULT
     context.user_data["awaiting_search_hours_input"] = True
     if update.message:
         await update.message.reply_text(
-            "<b>Search Hours</b>\n\n"
-            "Send the number of hours to search.\n\n"
+            "<b>Search by Hours Back</b>\n\n"
+            "Send how many hours back you want to search.\n\n"
             "<b>Example</b>\n"
             "<code>72</code>",
             reply_markup=build_main_menu_markup(),
@@ -2535,22 +3490,24 @@ async def apply_keywords_input(
             await update.message.reply_text("No valid keywords found. Send at least one keyword.")
         return False
 
-    # Legacy behavior: /setkeywords without source sets both lists.
-    arxiv_keywords = set_keywords_for_source(
-        user_id=user_id,
-        source=SOURCE_ARXIV,
-        keywords=keywords,
-        user_data=context.user_data,
-    )
-    pubmed_keywords = set_keywords_for_source(
-        user_id=user_id,
-        source=SOURCE_PUBMED,
-        keywords=keywords,
-        user_data=context.user_data,
-    )
+    # Legacy behavior: /setkeywords without source sets all source lists.
+    updated_by_source = {
+        source: set_keywords_for_source(
+            user_id=user_id,
+            source=source,
+            keywords=keywords,
+            user_data=context.user_data,
+        )
+        for source in keyword_sources()
+    }
 
     try:
-        papers = await refresh_cache(update, context)
+        papers = await refresh_cache(
+            update,
+            context,
+            hours_back=TODAY_HOURS_BACK,
+            scope=SEARCH_SCOPE_TODAY,
+        )
     except Exception as exc:
         logger.exception("Failed to refresh after setting keywords")
         if update.message:
@@ -2558,14 +3515,14 @@ async def apply_keywords_input(
         return False
 
     if update.message:
-        arxiv_body = "\n".join(f"• {html.escape(item)}" for item in arxiv_keywords) if arxiv_keywords else "(none)"
-        pubmed_body = "\n".join(f"• {html.escape(item)}" for item in pubmed_keywords) if pubmed_keywords else "(none)"
+        sections = []
+        for source in keyword_sources():
+            items = updated_by_source.get(source, [])
+            body = "\n".join(f"• {html.escape(item)}" for item in items) if items else "(none)"
+            sections.append(f"<b>{html.escape(paper_source_label(source))}</b>\n{body}")
         await update.message.reply_text(
             "<b>Keywords Updated</b>\n\n"
-            "<b>arXiv</b>\n"
-            f"{arxiv_body}\n\n"
-            "<b>PubMed</b>\n"
-            f"{pubmed_body}",
+            + "\n\n".join(sections),
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
         )
@@ -2573,8 +3530,8 @@ async def apply_keywords_input(
         update=update,
         context=context,
         papers_count=len(papers),
-        hours_back=int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK)),
-        scope=_normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY)),
+        hours_back=TODAY_HOURS_BACK,
+        scope=SEARCH_SCOPE_TODAY,
     )
     return True
 
@@ -2592,62 +3549,116 @@ async def apply_keywords_input_for_source(
             await update.message.reply_text("Could not identify your Telegram user.")
         return False
 
-    source_label = paper_source_label(source)
-    current = get_keywords_for_source(source, context.user_data, user_id=user_id)
-    by_fold = {item.casefold(): item for item in current}
+    source_norm = str(source or "").strip().casefold()
+    if source_norm != KEYWORD_SCOPE_ALL and source_norm not in ALL_PAPER_SOURCES:
+        source_norm = SOURCE_ARXIV
+    target_sources = keyword_sources() if source_norm == KEYWORD_SCOPE_ALL else [source_norm]
+    source_label = keyword_source_label(source_norm)
 
     changed = False
-    added: List[str] = []
-    skipped: List[str] = []
-    removed: List[str] = []
-    missing: List[str] = []
+    per_source_results: dict[str, dict[str, List[str]]] = {}
+    parsed_keywords = parse_keywords_input(raw)
+    if not parsed_keywords:
+        if update.message:
+            await update.message.reply_text("No valid keywords found. Send at least one keyword.")
+        return False
+
+    def _dedupe_fold(values: Sequence[str]) -> List[str]:
+        unique: List[str] = []
+        seen: set[str] = set()
+        for item in values:
+            key = item.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return unique
 
     if mode == "add":
-        new_keywords = parse_keywords_input(raw)
-        if not new_keywords:
-            if update.message:
-                await update.message.reply_text("No valid keywords found. Send at least one keyword.")
-            return False
+        for target_source in target_sources:
+            current = get_keywords_for_source(target_source, context.user_data, user_id=user_id)
+            by_fold = {item.casefold(): item for item in current}
+            added: List[str] = []
+            skipped: List[str] = []
 
-        for keyword in new_keywords:
-            key = keyword.casefold()
-            if key in by_fold:
-                skipped.append(by_fold[key])
-                continue
-            current.append(keyword)
-            by_fold[key] = keyword
-            added.append(keyword)
-            changed = True
-    elif mode == "remove":
-        remove_keywords = parse_keywords_input(raw)
-        if not remove_keywords:
-            if update.message:
-                await update.message.reply_text("No valid keywords found. Send at least one keyword.")
-            return False
+            for keyword in parsed_keywords:
+                key = keyword.casefold()
+                if key in by_fold:
+                    skipped.append(by_fold[key])
+                    continue
+                current.append(keyword)
+                by_fold[key] = keyword
+                added.append(keyword)
 
-        remove_keys = {keyword.casefold() for keyword in remove_keywords}
-        missing = [keyword for keyword in remove_keywords if keyword.casefold() not in by_fold]
-
-        updated_current: List[str] = []
-        for item in current:
-            if item.casefold() in remove_keys:
-                removed.append(item)
+            source_changed = bool(added)
+            if source_changed:
                 changed = True
-                continue
-            updated_current.append(item)
-        current = updated_current
+                current = set_keywords_for_source(
+                    user_id=user_id,
+                    source=target_source,
+                    keywords=current,
+                    user_data=context.user_data,
+                )
+
+            per_source_results[target_source] = {
+                "added": _dedupe_fold(added),
+                "skipped": _dedupe_fold(skipped),
+                "removed": [],
+                "missing": [],
+                "current": list(current),
+            }
+    elif mode == "remove":
+        remove_keys = {keyword.casefold() for keyword in parsed_keywords}
+        for target_source in target_sources:
+            current = get_keywords_for_source(target_source, context.user_data, user_id=user_id)
+            by_fold = {item.casefold(): item for item in current}
+            missing = [keyword for keyword in parsed_keywords if keyword.casefold() not in by_fold]
+            removed: List[str] = []
+            updated_current: List[str] = []
+            for item in current:
+                if item.casefold() in remove_keys:
+                    removed.append(item)
+                    continue
+                updated_current.append(item)
+
+            source_changed = bool(removed)
+            if source_changed:
+                changed = True
+                updated_current = set_keywords_for_source(
+                    user_id=user_id,
+                    source=target_source,
+                    keywords=updated_current,
+                    user_data=context.user_data,
+                )
+
+            per_source_results[target_source] = {
+                "added": [],
+                "skipped": [],
+                "removed": _dedupe_fold(removed),
+                "missing": _dedupe_fold(missing),
+                "current": list(updated_current),
+            }
     else:
         raise RuntimeError(f"Unsupported keyword mode: {mode}")
+
+    def _html_bullets(values: Sequence[str]) -> str:
+        if not values:
+            return "(none)"
+        return "\n".join(f"• {html.escape(v)}" for v in values)
 
     if not changed:
         if update.message:
             if mode == "add":
-                if skipped:
-                    skipped_block = "\n".join(f"• {html.escape(item)}" for item in skipped)
+                skipped_all = _dedupe_fold(
+                    item
+                    for target_source in target_sources
+                    for item in per_source_results.get(target_source, {}).get("skipped", [])
+                )
+                if skipped_all:
                     await update.message.reply_text(
                         f"<b>No new keywords added in {html.escape(source_label)}</b>\n\n"
                         "<b>Already present</b>\n"
-                        f"{skipped_block}",
+                        f"{_html_bullets(skipped_all)}",
                         reply_markup=build_main_menu_markup(),
                         parse_mode=ParseMode.HTML,
                     )
@@ -2657,49 +3668,47 @@ async def apply_keywords_input_for_source(
                         reply_markup=build_main_menu_markup(),
                     )
             else:
-                details = ""
-                if missing:
-                    details = "\n\nNot found:\n- " + "\n- ".join(missing)
+                missing_all = _dedupe_fold(
+                    item
+                    for target_source in target_sources
+                    for item in per_source_results.get(target_source, {}).get("missing", [])
+                )
+                details = f"\n\n<b>Not found</b>\n{_html_bullets(missing_all)}" if missing_all else ""
                 await update.message.reply_text(
                     f"No saved keywords matched in {source_label}.{details}",
                     reply_markup=build_main_menu_markup(),
+                    parse_mode=ParseMode.HTML,
                 )
         return False
 
-    updated = set_keywords_for_source(
-        user_id=user_id,
-        source=source,
-        keywords=current,
-        user_data=context.user_data,
-    )
-
-    def _html_bullets(values: Sequence[str]) -> str:
-        return "\n".join(f"• {html.escape(v)}" for v in values)
-
-    body_html = _html_bullets(updated) if updated else "(none)"
     if mode == "remove":
         if update.message:
-            lines = [
-                f"<b>{html.escape(source_label)} Keywords Updated</b>",
-                "",
-                f"<b>Removed</b> ({len(removed)})",
-                _html_bullets(removed),
-            ]
-            if missing:
+            lines: List[str] = [f"<b>{html.escape(source_label)} Keywords Updated</b>"]
+            for target_source in target_sources:
+                result = per_source_results[target_source]
+                if not result["removed"] and source_norm == KEYWORD_SCOPE_ALL:
+                    continue
                 lines.extend(
                     [
                         "",
-                        "<b>Not found</b>",
-                        _html_bullets(missing),
+                        f"<b>{html.escape(paper_source_label(target_source))}</b>",
+                        f"<b>Removed</b> ({len(result['removed'])})",
+                        _html_bullets(result["removed"]),
                     ]
                 )
-            lines.extend(
-                [
-                    "",
-                    f"<b>Current {html.escape(source_label)} keywords</b>",
-                    body_html,
-                ]
-            )
+                if result["missing"]:
+                    lines.extend(
+                        [
+                            "<b>Not found</b>",
+                            _html_bullets(result["missing"]),
+                        ]
+                    )
+                lines.extend(
+                    [
+                        f"<b>Current keywords</b>",
+                        _html_bullets(result["current"]),
+                    ]
+                )
             await update.message.reply_text(
                 "\n".join(lines),
                 reply_markup=build_main_menu_markup(),
@@ -2709,7 +3718,12 @@ async def apply_keywords_input_for_source(
 
     # Add mode: refresh now so the user can immediately open matching results.
     try:
-        papers = await refresh_cache(update, context)
+        papers = await refresh_cache(
+            update,
+            context,
+            hours_back=TODAY_HOURS_BACK,
+            scope=SEARCH_SCOPE_TODAY,
+        )
     except Exception as exc:
         logger.exception("Failed to refresh after keyword change")
         if update.message:
@@ -2720,27 +3734,36 @@ async def apply_keywords_input_for_source(
         return False
 
     if update.message:
-        hours_back = int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK))
-        scope = _normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY))
-        lines: List[str] = [
-            f"<b>{html.escape(source_label)} Keywords Updated</b>",
-            "",
-            f"<b>Added</b> ({len(added)})",
-            _html_bullets(added),
-        ]
-        if skipped:
+        hours_back = TODAY_HOURS_BACK
+        scope = SEARCH_SCOPE_TODAY
+        lines: List[str] = [f"<b>{html.escape(source_label)} Keywords Updated</b>"]
+        for target_source in target_sources:
+            result = per_source_results[target_source]
+            if not result["added"] and source_norm == KEYWORD_SCOPE_ALL:
+                continue
             lines.extend(
                 [
                     "",
-                    "<b>Skipped</b> (already present)",
-                    _html_bullets(skipped),
+                    f"<b>{html.escape(paper_source_label(target_source))}</b>",
+                    f"<b>Added</b> ({len(result['added'])})",
+                    _html_bullets(result["added"]),
+                ]
+            )
+            if result["skipped"]:
+                lines.extend(
+                    [
+                        "<b>Skipped</b> (already present)",
+                        _html_bullets(result["skipped"]),
+                    ]
+                )
+            lines.extend(
+                [
+                    f"<b>Current keywords</b>",
+                    _html_bullets(result["current"]),
                 ]
             )
         lines.extend(
             [
-                "",
-                f"<b>Current {html.escape(source_label)} keywords</b>",
-                body_html,
                 "",
                 (
                     f"<b>{len(papers)} matching paper(s)</b> in the last "
@@ -2760,8 +3783,8 @@ async def apply_keywords_input_for_source(
         update=update,
         context=context,
         papers_count=len(papers),
-        hours_back=int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK)),
-        scope=_normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY)),
+        hours_back=TODAY_HOURS_BACK,
+        scope=SEARCH_SCOPE_TODAY,
     )
     return True
 
@@ -2784,16 +3807,28 @@ async def apply_set_keywords_for_source(
             await update.message.reply_text("No valid keywords found. Send at least one keyword.")
         return False
 
-    source_label = paper_source_label(source)
-    updated = set_keywords_for_source(
-        user_id=user_id,
-        source=source,
-        keywords=keywords,
-        user_data=context.user_data,
-    )
+    source_norm = str(source or "").strip().casefold()
+    if source_norm != KEYWORD_SCOPE_ALL and source_norm not in ALL_PAPER_SOURCES:
+        source_norm = SOURCE_ARXIV
+    target_sources = keyword_sources() if source_norm == KEYWORD_SCOPE_ALL else [source_norm]
+    source_label = keyword_source_label(source_norm)
+    updated_by_source = {
+        target_source: set_keywords_for_source(
+            user_id=user_id,
+            source=target_source,
+            keywords=keywords,
+            user_data=context.user_data,
+        )
+        for target_source in target_sources
+    }
 
     try:
-        papers = await refresh_cache(update, context)
+        papers = await refresh_cache(
+            update,
+            context,
+            hours_back=TODAY_HOURS_BACK,
+            scope=SEARCH_SCOPE_TODAY,
+        )
     except Exception as exc:
         logger.exception("Failed to refresh after setting source keywords")
         if update.message:
@@ -2804,9 +3839,15 @@ async def apply_set_keywords_for_source(
         return False
 
     if update.message:
-        updated_body = "\n".join(f"• {html.escape(item)}" for item in updated) if updated else "(none)"
+        updated_sections = []
+        for target_source in target_sources:
+            updated = updated_by_source.get(target_source, [])
+            updated_body = "\n".join(f"• {html.escape(item)}" for item in updated) if updated else "(none)"
+            updated_sections.append(
+                f"<b>{html.escape(paper_source_label(target_source))}</b>\n{updated_body}"
+            )
         await update.message.reply_text(
-            f"<b>{html.escape(source_label)} Keywords Set</b>\n\n{updated_body}",
+            f"<b>{html.escape(source_label)} Keywords Set</b>\n\n" + "\n\n".join(updated_sections),
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
         )
@@ -2814,8 +3855,8 @@ async def apply_set_keywords_for_source(
         update=update,
         context=context,
         papers_count=len(papers),
-        hours_back=int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK)),
-        scope=_normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY)),
+        hours_back=TODAY_HOURS_BACK,
+        scope=SEARCH_SCOPE_TODAY,
     )
     return True
 
@@ -2852,9 +3893,13 @@ async def setkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await update.message.reply_text(
                     "Use this format:\n"
                     "arxiv kw1, kw2 + kw3\n"
+                    "biorxiv kw1, kw2 + kw3\n"
+                    "medrxiv kw1, kw2 + kw3\n"
+                    "chemrxiv kw1, kw2 + kw3\n"
                     "pubmed kw1, kw2 + kw3\n\n"
+                    "all kw1, kw2 + kw3\n\n"
                     "Use commas for separate alternatives (OR). Use + to search terms together (AND) in one entry.\n\n"
-                    f"You can also use {MENU_BTN_ADD_ARXIV_KEYWORD} or {MENU_BTN_ADD_PUBMED_KEYWORD}.",
+                    f"You can also use {MENU_BTN_ADD_KEYWORDS}.",
                     reply_markup=build_main_menu_markup(),
                 )
             return
@@ -2877,19 +3922,38 @@ async def clear_keywords_for_source(
             await update.message.reply_text("Could not identify your Telegram user.")
         return False
 
-    source_label = paper_source_label(source)
-    set_keywords_for_source(
-        user_id=user_id,
-        source=source,
-        keywords=[],
-        user_data=context.user_data,
-    )
+    _clear_pending_input_flags(context)
+    source_norm = str(source or "").strip().casefold()
+    if source_norm != KEYWORD_SCOPE_ALL and source_norm not in ALL_PAPER_SOURCES:
+        source_norm = SOURCE_ARXIV
+    target_sources = keyword_sources() if source_norm == KEYWORD_SCOPE_ALL else [source_norm]
+    source_label = keyword_source_label(source_norm)
+    for target_source in target_sources:
+        set_keywords_for_source(
+            user_id=user_id,
+            source=target_source,
+            keywords=[],
+            user_data=context.user_data,
+        )
 
+    text = (
+        "Cleared keywords for all sources."
+        if source_norm == KEYWORD_SCOPE_ALL
+        else f"Cleared all {source_label} keywords."
+    )
     if update.message:
         await update.message.reply_text(
-            f"Cleared all {source_label} keywords.",
+            text,
             reply_markup=build_main_menu_markup(),
         )
+    else:
+        chat = update.effective_chat
+        if chat is not None:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=text,
+                reply_markup=build_main_menu_markup(),
+            )
     return True
 
 
@@ -2907,7 +3971,11 @@ async def clearkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text(
                 "Choose one source:\n"
                 "- arxiv\n"
+                "- biorxiv\n"
+                "- medrxiv\n"
+                "- chemrxiv\n"
                 "- pubmed\n\n"
+                "Or use: all\n\n"
                 "Or use the clear buttons in the menu.",
                 reply_markup=build_main_menu_markup(),
             )
@@ -2917,23 +3985,18 @@ async def clearkeywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await clear_keywords_for_source(update, context, source)
         return
     else:
-        set_keywords_for_source(
-            user_id=user_id,
-            source=SOURCE_ARXIV,
-            keywords=[],
-            user_data=context.user_data,
-        )
-        set_keywords_for_source(
-            user_id=user_id,
-            source=SOURCE_PUBMED,
-            keywords=[],
-            user_data=context.user_data,
-        )
+        for target_source in keyword_sources():
+            set_keywords_for_source(
+                user_id=user_id,
+                source=target_source,
+                keywords=[],
+                user_data=context.user_data,
+            )
         _save_user_setting(user_id, "custom_keywords", None)
 
     if update.message:
         await update.message.reply_text(
-            "Cleared keywords for both sources.",
+            "Cleared keywords for all sources.",
             reply_markup=build_main_menu_markup(),
         )
 
@@ -2945,9 +4008,13 @@ async def addkeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "Use this format:\n"
                 "arxiv quantum mechanics\n"
                 "arxiv astronomy, climate change + photosynthesis\n"
+                "biorxiv microbiome\n"
+                "medrxiv sepsis\n"
+                "chemrxiv catalyst\n"
                 "pubmed genetics\n\n"
+                "all llm, diffusion model\n\n"
                 "Use commas for separate alternatives (OR). Use + to search terms together (AND) in one entry.\n\n"
-                f"Or use {MENU_BTN_ADD_ARXIV_KEYWORD} / {MENU_BTN_ADD_PUBMED_KEYWORD}.",
+                f"Or use {MENU_BTN_ADD_KEYWORDS}.",
                 reply_markup=build_main_menu_markup(),
             )
         return
@@ -2955,7 +4022,7 @@ async def addkeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if source is None:
         if update.message:
             await update.message.reply_text(
-                "Source must be `arxiv` or `pubmed`.",
+                "Source must be one of: arxiv, biorxiv, medrxiv, chemrxiv, pubmed, all.",
                 reply_markup=build_main_menu_markup(),
             )
         return
@@ -2976,9 +4043,13 @@ async def removekeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 "Use this format:\n"
                 "arxiv quantum mechanics\n"
                 "arxiv astronomy, climate change + photosynthesis\n"
+                "biorxiv microbiome\n"
+                "medrxiv sepsis\n"
+                "chemrxiv catalyst\n"
                 "pubmed genetics\n\n"
+                "all llm, diffusion model\n\n"
                 "When removing keywords, use the saved clause exactly.\n\n"
-                f"Or use {MENU_BTN_REMOVE_ARXIV_KEYWORD} / {MENU_BTN_REMOVE_PUBMED_KEYWORD}.",
+                f"Or use {MENU_BTN_REMOVE_KEYWORDS}.",
                 reply_markup=build_main_menu_markup(),
             )
         return
@@ -2986,7 +4057,7 @@ async def removekeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if source is None:
         if update.message:
             await update.message.reply_text(
-                "Source must be `arxiv` or `pubmed`.",
+                "Source must be one of: arxiv, biorxiv, medrxiv, chemrxiv, pubmed, all.",
                 reply_markup=build_main_menu_markup(),
             )
         return
@@ -3415,6 +4486,40 @@ async def recap_timezone_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
 
+async def keyword_scope_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    data = query.data or ""
+    if not data.startswith("kwmenu:"):
+        await query.answer()
+        return
+
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Invalid keyword action.", show_alert=True)
+        return
+    _, action, source = parts
+    action_norm = normalize_text(action).casefold()
+    source_norm = normalize_text(source).casefold()
+    if action_norm not in {"add", "remove", "clear"}:
+        await query.answer("Invalid keyword action.", show_alert=True)
+        return
+    if source_norm != KEYWORD_SCOPE_ALL and source_norm not in ALL_PAPER_SOURCES:
+        await query.answer("Invalid source.", show_alert=True)
+        return
+
+    await query.answer()
+    if action_norm == "add":
+        await prompt_add_keyword_for_source(update, context, source_norm)
+        return
+    if action_norm == "remove":
+        await prompt_remove_keyword_for_source(update, context, source_norm)
+        return
+    await clear_keywords_for_source(update, context, source_norm)
+
+
 async def open_matches_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -3546,12 +4651,9 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     menu_actions = {
         MENU_BTN_TODAY.casefold(): today_cmd,
         MENU_BTN_KEYWORDS.casefold(): keywords_cmd,
-        MENU_BTN_ADD_ARXIV_KEYWORD.casefold(): prompt_add_arxiv_keyword_input,
-        MENU_BTN_REMOVE_ARXIV_KEYWORD.casefold(): prompt_remove_arxiv_keyword_input,
-        MENU_BTN_CLEAR_ARXIV_KEYWORD.casefold(): clear_arxiv_keywords_cmd,
-        MENU_BTN_ADD_PUBMED_KEYWORD.casefold(): prompt_add_pubmed_keyword_input,
-        MENU_BTN_REMOVE_PUBMED_KEYWORD.casefold(): prompt_remove_pubmed_keyword_input,
-        MENU_BTN_CLEAR_PUBMED_KEYWORD.casefold(): clear_pubmed_keywords_cmd,
+        MENU_BTN_ADD_KEYWORDS.casefold(): prompt_add_keywords_menu,
+        MENU_BTN_REMOVE_KEYWORDS.casefold(): prompt_remove_keywords_menu,
+        MENU_BTN_CLEAR_KEYWORDS.casefold(): prompt_clear_keywords_menu,
         MENU_BTN_SEARCH_HOURS.casefold(): prompt_searchhours_input,
         MENU_BTN_DAILY_RECAP.casefold(): toggledailyrecap_cmd,
         MENU_BTN_SET_RECAP_TIME.casefold(): prompt_setrecaptime_input,
@@ -3649,8 +4751,11 @@ async def debugquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     raw_breakdown = context.user_data.get("last_raw_entry_breakdown", {})
     request_url = context.user_data.get("last_request_url", "")
     keywords_by_source = get_keywords_by_source(context.user_data, user_id=user_id)
-    arxiv_keywords = keywords_by_source[SOURCE_ARXIV]
-    pubmed_keywords = keywords_by_source[SOURCE_PUBMED]
+    arxiv_keywords = keywords_by_source.get(SOURCE_ARXIV, [])
+    biorxiv_keywords = keywords_by_source.get(SOURCE_BIORXIV, [])
+    medrxiv_keywords = keywords_by_source.get(SOURCE_MEDRXIV, [])
+    chemrxiv_keywords = keywords_by_source.get(SOURCE_CHEMRXIV, [])
+    pubmed_keywords = keywords_by_source.get(SOURCE_PUBMED, [])
     hours_back = int(context.user_data.get("cache_hours_back", TODAY_HOURS_BACK))
     scope = _normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY))
 
@@ -3660,24 +4765,45 @@ async def debugquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         query_lines: List[str] = []
         if arxiv_query:
             query_lines.append(f"arXiv: {arxiv_query}")
+        if biorxiv_keywords:
+            query_lines.append(f"bioRxiv keywords: {', '.join(biorxiv_keywords)}")
+        if medrxiv_keywords:
+            query_lines.append(f"medRxiv keywords: {', '.join(medrxiv_keywords)}")
+        if chemrxiv_keywords:
+            query_lines.append(f"ChemRxiv keywords: {', '.join(chemrxiv_keywords)}")
         if pubmed_query:
             query_lines.append(f"PubMed: {pubmed_query}")
         query = "\n".join(query_lines) if query_lines else "(no active query)"
 
     arxiv_raw = 0
+    biorxiv_raw = 0
+    medrxiv_raw = 0
+    chemrxiv_raw = 0
     pubmed_raw = 0
     if isinstance(raw_breakdown, dict):
         arxiv_raw = int(raw_breakdown.get("arxiv", 0) or 0)
+        biorxiv_raw = int(raw_breakdown.get("biorxiv", 0) or 0)
+        medrxiv_raw = int(raw_breakdown.get("medrxiv", 0) or 0)
+        chemrxiv_raw = int(raw_breakdown.get("chemrxiv", 0) or 0)
         pubmed_raw = int(raw_breakdown.get("pubmed", 0) or 0)
 
     msg = (
         f"Search scope: {_describe_search_window(scope, hours_back)}\n"
         f"Hours back: {hours_back}\n"
         f"arXiv keywords: {arxiv_keywords if arxiv_keywords else '(none)'}\n"
+        f"bioRxiv keywords: {biorxiv_keywords if biorxiv_keywords else '(none)'}\n"
+        f"medRxiv keywords: {medrxiv_keywords if medrxiv_keywords else '(none)'}\n"
+        f"ChemRxiv keywords: {chemrxiv_keywords if chemrxiv_keywords else '(none)'}\n"
         f"PubMed keywords: {pubmed_keywords if pubmed_keywords else '(none)'}\n\n"
         f"Current queries:\n{query}\n\n"
         f"Last raw entry count: {raw_count} "
-        f"(arXiv: {arxiv_raw}, PubMed: {pubmed_raw})"
+        "("
+        f"arXiv: {arxiv_raw}, "
+        f"bioRxiv: {biorxiv_raw}, "
+        f"medRxiv: {medrxiv_raw}, "
+        f"ChemRxiv: {chemrxiv_raw}, "
+        f"PubMed: {pubmed_raw}"
+        ")"
     )
 
     if request_url:
@@ -3747,7 +4873,7 @@ async def run_search_for_hours(
         if not query:
             text = (
                 "No keywords set yet.\n\n"
-                f"Use {MENU_BTN_ADD_ARXIV_KEYWORD} and {MENU_BTN_ADD_PUBMED_KEYWORD} "
+                f"Use {MENU_BTN_ADD_KEYWORDS} and choose a source "
                 "to add your keywords."
             )
         else:
@@ -3949,8 +5075,29 @@ async def bookmarks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
         return
 
+    cached_by_ref = {
+        paper_ref_for(paper): paper
+        for paper in context.user_data.get("papers", [])
+        if isinstance(paper, Paper)
+    }
+    resolved_from_cache: List[Paper] = []
+    unresolved_refs: List[str] = []
+    seen_refs: set[str] = set()
+    for ref in bookmark_ids:
+        if ref in seen_refs:
+            continue
+        seen_refs.add(ref)
+        cached = cached_by_ref.get(ref)
+        if cached is not None:
+            resolved_from_cache.append(cached)
+        else:
+            unresolved_refs.append(ref)
+
+    fetched: List[Paper] = []
+    missing: List[str] = []
     try:
-        papers, missing = await fetch_papers_by_refs(bookmark_ids)
+        if unresolved_refs:
+            fetched, missing = await fetch_papers_by_refs(unresolved_refs)
     except Exception as exc:
         logger.exception("Failed to fetch bookmarked papers")
         if update.message:
@@ -3959,6 +5106,10 @@ async def bookmarks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 reply_markup=build_main_menu_markup(),
             )
         return
+
+    papers = resolved_from_cache + fetched
+    for idx, paper in enumerate(papers, start=1):
+        paper.index = idx
 
     if not papers:
         if update.message:
@@ -4035,6 +5186,7 @@ def main() -> None:
     app.add_handler(CommandHandler("refresh", refresh_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_router))
     app.add_handler(CallbackQueryHandler(recap_timezone_callback, pattern=r"^rtz"))
+    app.add_handler(CallbackQueryHandler(keyword_scope_callback, pattern=r"^kwmenu:"))
     app.add_handler(CallbackQueryHandler(open_matches_callback, pattern=r"^open_matches:"))
     app.add_handler(CallbackQueryHandler(more_results_callback, pattern=r"^more_results:"))
     app.add_handler(CallbackQueryHandler(pdf_callback, pattern=r"^pdf:"))
