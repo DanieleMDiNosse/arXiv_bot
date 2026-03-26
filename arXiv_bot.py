@@ -17,6 +17,7 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, List, Optional, Sequence
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo, available_timezones
 
 import feedparser
@@ -1323,6 +1324,8 @@ def _crossref_item_to_preprint_paper(
         if "pdf" in content_type or url.endswith(".pdf"):
             link_pdf = url
             break
+    if not link_pdf:
+        link_pdf = _guess_pdf_link_for_source(source=source, paper_id=doi, link_abs=link_abs)
 
     category = ""
     container_titles = item.get("container-title", [])
@@ -1531,6 +1534,8 @@ def _openalex_item_to_preprint_paper(item: dict[str, Any], *, source: str) -> Op
         link_abs = normalize_text(str(best_oa_location.get("landing_page_url") or ""))
     if not link_abs:
         link_abs = f"https://doi.org/{doi}"
+    if not link_pdf:
+        link_pdf = _guess_pdf_link_for_source(source=source, paper_id=doi, link_abs=link_abs)
 
     category = ""
     primary_topic = item.get("primary_topic")
@@ -1556,6 +1561,82 @@ def _openalex_item_to_preprint_paper(item: dict[str, Any], *, source: str) -> Op
         link_pdf=link_pdf,
         source=source,
     )
+
+
+def _ssrn_abstract_id_from_text(raw: str) -> str:
+    token = normalize_text(raw).casefold()
+    if not token:
+        return ""
+    match = re.search(r"10\.2139/ssrn\.?(\d+)", token)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def _ssrn_abstract_id_from_url(url: str) -> str:
+    parsed = urlparse(normalize_text(url))
+    if not parsed.netloc:
+        return ""
+    query = parse_qs(parsed.query or "")
+    for key in ("abstract_id", "abstractid"):
+        values = query.get(key, [])
+        if values:
+            candidate = normalize_text(str(values[0]))
+            if candidate.isdigit():
+                return candidate
+    return ""
+
+
+def _ieee_arnumber_from_url(url: str) -> str:
+    parsed = urlparse(normalize_text(url))
+    if not parsed.netloc:
+        return ""
+    query = parse_qs(parsed.query or "")
+    query_candidate = normalize_text(str((query.get("arnumber") or [""])[0]))
+    if query_candidate.isdigit():
+        return query_candidate
+
+    path_match = re.search(r"/document/(\d+)", parsed.path or "")
+    if path_match:
+        return path_match.group(1)
+    return ""
+
+
+def _guess_pdf_link_for_source(*, source: str, paper_id: str, link_abs: str) -> str:
+    source_norm = normalize_text(source).casefold()
+    paper_id_norm = normalize_text(paper_id)
+    link_abs_norm = normalize_text(link_abs)
+
+    if source_norm == SOURCE_SSRN:
+        abstract_id = _ssrn_abstract_id_from_text(paper_id_norm) or _ssrn_abstract_id_from_url(link_abs_norm)
+        if abstract_id:
+            return f"https://papers.ssrn.com/sol3/Delivery.cfm?abstractid={abstract_id}"
+        return ""
+
+    if source_norm == SOURCE_IEEE:
+        arnumber = _ieee_arnumber_from_url(link_abs_norm)
+        if not arnumber:
+            trailing_digits = re.search(r"(\d+)$", paper_id_norm)
+            if trailing_digits:
+                arnumber = trailing_digits.group(1)
+        if arnumber:
+            return f"https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber={arnumber}"
+        return ""
+
+    return ""
+
+
+def resolve_paper_pdf_link(paper: Paper) -> str:
+    if paper.link_pdf:
+        return paper.link_pdf
+    guessed = _guess_pdf_link_for_source(
+        source=paper.source,
+        paper_id=paper.arxiv_id,
+        link_abs=paper.link_abs,
+    )
+    if guessed:
+        paper.link_pdf = guessed
+    return guessed
 
 
 def _keywords_to_openalex_search_query(keywords: Sequence[str]) -> str:
@@ -2493,9 +2574,10 @@ def build_paper_reply_markup(
     implemented as a callback button rather than a clickable text icon.
     """
     buttons: List[InlineKeyboardButton] = []
+    pdf_link = resolve_paper_pdf_link(paper)
     if paper.link_abs:
         buttons.append(InlineKeyboardButton(text=paper.link_abs, url=paper.link_abs))
-    if paper.link_pdf and paper.arxiv_id:
+    if pdf_link and paper.arxiv_id:
         buttons.append(
             InlineKeyboardButton(text="📄", callback_data=f"pdf:{paper_ref_for(paper)}")
         )
@@ -5283,7 +5365,8 @@ async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    if not paper.link_pdf:
+    pdf_link = resolve_paper_pdf_link(paper)
+    if not pdf_link:
         await query.answer("No PDF link is available for this paper.", show_alert=True)
         return
 
@@ -5297,7 +5380,7 @@ async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             raise RuntimeError("Could not determine the Telegram chat for the PDF download.")
         await context.bot.send_document(
             chat_id=chat.id,
-            document=paper.link_pdf,
+            document=pdf_link,
             caption=caption,
         )
     except Exception:
@@ -5307,7 +5390,7 @@ async def pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 chat_id=chat.id,
                 text=(
                     "Could not send the PDF through Telegram.\n\n"
-                    f"Direct PDF link:\n{paper.link_pdf}"
+                    f"Direct PDF link:\n{pdf_link}"
                 ),
             )
 
