@@ -93,6 +93,8 @@ MENU_BTN_BOOKMARKS = "Bookmarks"
 MENU_BTN_HELP = "Help"
 MENU_BTN_REPORT = "Feedback"
 MENU_BTN_COFFEE = "Pay me a coffee"
+MENU_BTN_MORE = "More"
+MORE_MENU_MESSAGE_TEXT = "Additional features are shown below"
 SOURCE_ARXIV = "arxiv"
 SOURCE_BIORXIV = "biorxiv"
 SOURCE_MEDRXIV = "medrxiv"
@@ -137,7 +139,7 @@ def build_main_menu_markup() -> ReplyKeyboardMarkup:
             [MENU_BTN_ADD_KEYWORDS, MENU_BTN_REMOVE_KEYWORDS, MENU_BTN_CLEAR_KEYWORDS],
             [MENU_BTN_DAILY_RECAP, MENU_BTN_SET_RECAP_TIME, MENU_BTN_RECAP_STATUS],
             [MENU_BTN_HELP],
-            [MENU_BTN_REPORT, MENU_BTN_COFFEE],
+            [MENU_BTN_MORE],
         ],
         resize_keyboard=True,
     )
@@ -188,6 +190,16 @@ def build_coffee_markup() -> Optional[InlineKeyboardMarkup]:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(text="Open support link", url=COFFEE_URL)]]
     )
+
+
+def build_more_menu_markup() -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text=MENU_BTN_REPORT, callback_data="moremenu:report"),
+            InlineKeyboardButton(text=MENU_BTN_COFFEE, callback_data="moremenu:coffee"),
+        ]
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def _parse_report_chat_ids(raw_value: Any, *, source_name: str) -> List[int]:
@@ -3831,28 +3843,41 @@ def build_help_text() -> str:
         '• List example: <code>- quantum mechanics\n- entanglement + superconductivity</code>\n\n'
         "<b>Other</b>\n"
         f"• <b>{html.escape(MENU_BTN_HELP)}</b>: show this guide\n"
-        f"• <b>{html.escape(MENU_BTN_REPORT)}</b>: report bugs or send feature requests\n"
-        f"• <b>{html.escape(MENU_BTN_COFFEE)}</b>: open support link"
+        f"• <b>{html.escape(MENU_BTN_MORE)}</b>: open feedback and support options"
     )
 
 
-async def coffee_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
+async def prompt_more_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if update.message is not None:
+        await update.message.reply_text(
+            MORE_MENU_MESSAGE_TEXT,
+            reply_markup=build_more_menu_markup(),
+        )
+        return
+    if chat is not None:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=MORE_MENU_MESSAGE_TEXT,
+            reply_markup=build_more_menu_markup(),
+        )
+
+
+async def _send_coffee_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None:
         return
 
     markup = build_coffee_markup()
     if not COFFEE_EVM_ADDRESS and not COFFEE_SOLANA_ADDRESS and not COFFEE_BTC_ADDRESS:
         if markup is None:
-            await update.message.reply_text(
-                "No support destination is configured yet.",
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="No support destination is configured yet.",
                 reply_markup=build_main_menu_markup(),
             )
             return
-        await update.message.reply_text(
-            COFFEE_TEXT,
-            reply_markup=markup,
-            disable_web_page_preview=True,
-        )
+        await context.bot.send_message(chat_id=chat.id, text=COFFEE_TEXT, reply_markup=markup, disable_web_page_preview=True)
         return
 
     address_lines: List[str] = []
@@ -3877,43 +3902,84 @@ async def coffee_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         + "\n\n"
         "Please double-check the address before sending."
     )
-    await update.message.reply_text(
-        message,
-        reply_markup=markup if markup is not None else build_main_menu_markup(),
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text=message,
+        reply_markup=markup,
         disable_web_page_preview=True,
         parse_mode=ParseMode.HTML,
     )
 
 
-async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
+async def coffee_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_coffee_message(update, context)
+
+
+async def _send_report_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None:
         return
 
     if not get_report_forward_chat_ids():
-        await update.message.reply_text(
-            "Report inbox is not configured yet on this bot.",
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="Report inbox is not configured yet on this bot.",
             reply_markup=build_main_menu_markup(),
         )
         return
 
     user_id = _get_user_id(update)
     if user_id is not None and _remaining_feedback_slots(user_id, context.user_data) <= 0:
-        await update.message.reply_text(
-            _feedback_limit_reached_text(),
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=_feedback_limit_reached_text(),
             reply_markup=build_main_menu_markup(),
         )
         return
 
     _clear_pending_input_flags(context)
     context.user_data["awaiting_report_input"] = True
-    await update.message.reply_text(
-        "<b>Report an issue or Request a new feature</b>\n\n"
-        "Write your message and send it here.\n"
-        "Your message will be forwarded to the maintainer.\n\n"
-        "To cancel, press any other menu button.",
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text=(
+            "<b>Report an issue or Request a new feature</b>\n\n"
+            "Write your message and send it here.\n"
+            "Your message will be forwarded to the maintainer.\n\n"
+            "To cancel, press any other menu button."
+        ),
         reply_markup=build_main_menu_markup(),
         parse_mode=ParseMode.HTML,
     )
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_report_prompt(update, context)
+
+
+async def more_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    data = query.data or ""
+    if not data.startswith("moremenu:"):
+        await query.answer()
+        return
+
+    action = data.removeprefix("moremenu:").strip().casefold()
+    await query.answer()
+    if query.message is not None:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            logger.exception("Could not clear More menu markup")
+
+    if action == "report":
+        await _send_report_prompt(update, context)
+        return
+    if action == "coffee":
+        await _send_coffee_message(update, context)
+        return
 
 
 async def apply_report_input(
@@ -5558,8 +5624,7 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         MENU_BTN_RECAP_STATUS.casefold(): dailyrecap_status_cmd,
         MENU_BTN_BOOKMARKS.casefold(): bookmarks_cmd,
         MENU_BTN_HELP.casefold(): help_cmd,
-        MENU_BTN_REPORT.casefold(): report_cmd,
-        MENU_BTN_COFFEE.casefold(): coffee_cmd,
+        MENU_BTN_MORE.casefold(): prompt_more_menu,
     }
 
     pending_flags = [
@@ -6102,6 +6167,7 @@ def main() -> None:
     app.add_handler(CommandHandler("debugquery", debugquery_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_router))
+    app.add_handler(CallbackQueryHandler(more_menu_callback, pattern=r"^moremenu:"))
     app.add_handler(CallbackQueryHandler(recap_timezone_callback, pattern=r"^rtz"))
     app.add_handler(CallbackQueryHandler(keyword_scope_callback, pattern=r"^kwmenu:"))
     app.add_handler(CallbackQueryHandler(open_matches_callback, pattern=r"^open_matches:"))
