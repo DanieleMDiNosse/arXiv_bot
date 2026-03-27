@@ -94,6 +94,7 @@ MENU_BTN_HELP = "Help"
 MENU_BTN_REPORT = "Feedback"
 MENU_BTN_COFFEE = "Pay me a coffee"
 MENU_BTN_MORE = "More"
+MENU_BTN_GLOBAL_SEARCH = "Global Search"
 MORE_MENU_MESSAGE_TEXT = "Additional features are shown below"
 SOURCE_ARXIV = "arxiv"
 SOURCE_BIORXIV = "biorxiv"
@@ -106,6 +107,7 @@ KEYWORD_SCOPE_ALL = "all"
 WELCOME_SHOWN_AT_KEY = "welcome_shown_at"
 SEARCH_SCOPE_TODAY = "today"
 SEARCH_SCOPE_HOURS = "hours"
+SEARCH_SCOPE_GLOBAL = "global"
 
 ARXIV_FAMILY_SOURCES = {
     SOURCE_ARXIV,
@@ -195,9 +197,71 @@ def build_coffee_markup() -> Optional[InlineKeyboardMarkup]:
 def build_more_menu_markup() -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = [
         [
+            InlineKeyboardButton(text=MENU_BTN_GLOBAL_SEARCH, callback_data="moremenu:globalsearch"),
+        ],
+        [
             InlineKeyboardButton(text=MENU_BTN_REPORT, callback_data="moremenu:report"),
             InlineKeyboardButton(text=MENU_BTN_COFFEE, callback_data="moremenu:coffee"),
         ]
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def build_global_search_sources_markup(selected_sources: Sequence[str]) -> InlineKeyboardMarkup:
+    selected = {
+        source
+        for source in (
+            str(item or "").strip().casefold()
+            for item in selected_sources
+        )
+        if source in ALL_PAPER_SOURCES
+    }
+
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=f"{'✅ ' if SOURCE_ARXIV in selected else ''}arXiv",
+                callback_data=f"gsearch:toggle:{SOURCE_ARXIV}",
+            ),
+            InlineKeyboardButton(
+                text=f"{'✅ ' if SOURCE_BIORXIV in selected else ''}bioRxiv",
+                callback_data=f"gsearch:toggle:{SOURCE_BIORXIV}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"{'✅ ' if SOURCE_MEDRXIV in selected else ''}medRxiv",
+                callback_data=f"gsearch:toggle:{SOURCE_MEDRXIV}",
+            ),
+            InlineKeyboardButton(
+                text=f"{'✅ ' if SOURCE_CHEMRXIV in selected else ''}ChemRxiv",
+                callback_data=f"gsearch:toggle:{SOURCE_CHEMRXIV}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"{'✅ ' if SOURCE_SSRN in selected else ''}SSRN",
+                callback_data=f"gsearch:toggle:{SOURCE_SSRN}",
+            ),
+            InlineKeyboardButton(
+                text=f"{'✅ ' if SOURCE_IEEE in selected else ''}IEEE",
+                callback_data=f"gsearch:toggle:{SOURCE_IEEE}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"{'✅ ' if SOURCE_PUBMED in selected else ''}PubMed",
+                callback_data=f"gsearch:toggle:{SOURCE_PUBMED}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(text="Select All", callback_data="gsearch:all"),
+            InlineKeyboardButton(text="Clear All", callback_data="gsearch:clear"),
+        ],
+        [
+            InlineKeyboardButton(text="Search", callback_data="gsearch:start"),
+            InlineKeyboardButton(text="Cancel", callback_data="gsearch:cancel"),
+        ],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -1449,13 +1513,18 @@ def ensure_utc(dt: datetime) -> datetime:
 
 def _normalize_search_scope(scope: Any) -> str:
     token = normalize_text(str(scope or "")).casefold()
+    if token == SEARCH_SCOPE_GLOBAL:
+        return SEARCH_SCOPE_GLOBAL
     if token == SEARCH_SCOPE_TODAY:
         return SEARCH_SCOPE_TODAY
     return SEARCH_SCOPE_HOURS
 
 
 def _describe_search_window(scope: str, hours_back: int) -> str:
-    if _normalize_search_scope(scope) == SEARCH_SCOPE_TODAY:
+    normalized_scope = _normalize_search_scope(scope)
+    if normalized_scope == SEARCH_SCOPE_GLOBAL:
+        return "all time"
+    if normalized_scope == SEARCH_SCOPE_TODAY:
         return f"the last {TODAY_HOURS_BACK} hours"
     return f"the last {int(hours_back)} hours"
 
@@ -1626,6 +1695,20 @@ def fetch_recent_rxiv_papers(
     hours_back: int,
     max_results: int = DEFAULT_MAX_RESULTS,
 ) -> tuple[list[Paper], str, int]:
+    return fetch_rxiv_papers(
+        source=source,
+        keywords=keywords,
+        hours_back=hours_back,
+        max_results=max_results,
+    )
+
+
+def fetch_rxiv_papers(
+    source: str,
+    keywords: Sequence[str],
+    hours_back: Optional[int] = None,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
     source_norm = str(source).casefold()
     if source_norm not in {SOURCE_BIORXIV, SOURCE_MEDRXIV}:
         return [], "", 0
@@ -1633,7 +1716,7 @@ def fetch_recent_rxiv_papers(
     # title/abstract keyword query. Use OpenAlex source-scoped search so these
     # sources match arXiv's "keyword query first, local recency filter second"
     # behavior.
-    return _fetch_recent_openalex_preprint_papers(
+    return fetch_openalex_preprint_papers(
         source=source_norm,
         keywords=keywords,
         hours_back=hours_back,
@@ -1734,30 +1817,39 @@ def _crossref_item_to_preprint_paper(
     )
 
 
-def fetch_recent_crossref_preprint_papers(
+def fetch_crossref_preprint_papers(
     source: str,
     doi_prefix: str,
     keywords: Sequence[str],
-    hours_back: int,
+    hours_back: Optional[int] = None,
     query_text: str = "",
     max_results: int = DEFAULT_MAX_RESULTS,
 ) -> tuple[list[Paper], str, int]:
-    now_utc = datetime.now(timezone.utc)
-    cutoff = now_utc - timedelta(hours=hours_back)
-    from_date = (cutoff - timedelta(days=2)).date().isoformat()
-    to_date = now_utc.date().isoformat()
-
     rows = max(1, min(100, int(max_results)))
     cursor = "*"
     papers: List[Paper] = []
     seen_refs: set[str] = set()
     request_urls: List[str] = []
     raw_count = 0
+    now_utc = datetime.now(timezone.utc)
+    cutoff = None
+    if hours_back is not None and int(hours_back) > 0:
+        cutoff = now_utc - timedelta(hours=int(hours_back))
+    filter_tokens = [f"prefix:{doi_prefix}"]
+    if cutoff is not None:
+        from_date = (cutoff - timedelta(days=2)).date().isoformat()
+        to_date = now_utc.date().isoformat()
+        filter_tokens.extend(
+            [
+                f"from-created-date:{from_date}",
+                f"until-created-date:{to_date}",
+            ]
+        )
 
     # Cursor pagination; keep a hard cap to avoid runaway loops.
     for _ in range(20):
         params = {
-            "filter": f"prefix:{doi_prefix},from-created-date:{from_date},until-created-date:{to_date}",
+            "filter": ",".join(filter_tokens),
             "sort": "updated",
             "order": "desc",
             "rows": rows,
@@ -1794,7 +1886,7 @@ def fetch_recent_crossref_preprint_papers(
             if paper is None:
                 continue
             recency = max(paper.published, paper.updated)
-            if recency < cutoff:
+            if cutoff is not None and recency < cutoff:
                 continue
             if not _keywords_match_text(keywords, f"{paper.title}\n{paper.summary}"):
                 continue
@@ -1821,12 +1913,43 @@ def fetch_recent_crossref_preprint_papers(
     return papers, request_url, raw_count
 
 
+def fetch_recent_crossref_preprint_papers(
+    source: str,
+    doi_prefix: str,
+    keywords: Sequence[str],
+    hours_back: int,
+    query_text: str = "",
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    return fetch_crossref_preprint_papers(
+        source=source,
+        doi_prefix=doi_prefix,
+        keywords=keywords,
+        hours_back=hours_back,
+        query_text=query_text,
+        max_results=max_results,
+    )
+
+
 def fetch_recent_chemrxiv_papers(
     keywords: Sequence[str],
     hours_back: int,
     max_results: int = DEFAULT_MAX_RESULTS,
 ) -> tuple[list[Paper], str, int]:
-    return _fetch_recent_openalex_preprint_papers(
+    return fetch_openalex_preprint_papers(
+        source=SOURCE_CHEMRXIV,
+        keywords=keywords,
+        hours_back=hours_back,
+        max_results=max_results,
+    )
+
+
+def fetch_chemrxiv_papers(
+    keywords: Sequence[str],
+    hours_back: Optional[int] = None,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    return fetch_openalex_preprint_papers(
         source=SOURCE_CHEMRXIV,
         keywords=keywords,
         hours_back=hours_back,
@@ -1842,6 +1965,22 @@ def fetch_recent_ieee_papers(
     # IEEE content is indexed in Crossref primarily under DOI prefix 10.1109.
     query_text = _keywords_to_search_query(keywords)
     return fetch_recent_crossref_preprint_papers(
+        source=SOURCE_IEEE,
+        doi_prefix="10.1109",
+        keywords=keywords,
+        hours_back=hours_back,
+        query_text=query_text,
+        max_results=max_results,
+    )
+
+
+def fetch_ieee_papers(
+    keywords: Sequence[str],
+    hours_back: Optional[int] = None,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    query_text = _keywords_to_search_query(keywords)
+    return fetch_crossref_preprint_papers(
         source=SOURCE_IEEE,
         doi_prefix="10.1109",
         keywords=keywords,
@@ -2061,10 +2200,10 @@ def _openalex_preprint_window_timestamp(paper: Paper) -> datetime:
     return paper.published
 
 
-def _fetch_recent_openalex_preprint_papers(
+def fetch_openalex_preprint_papers(
     source: str,
     keywords: Sequence[str],
-    hours_back: int,
+    hours_back: Optional[int] = None,
     max_results: int = DEFAULT_MAX_RESULTS,
 ) -> tuple[list[Paper], str, int]:
     source_norm = str(source).casefold()
@@ -2073,8 +2212,9 @@ def _fetch_recent_openalex_preprint_papers(
     if not source_id or not search_query:
         return [], "", 0
 
-    now_utc = datetime.now(timezone.utc)
-    cutoff = now_utc - timedelta(hours=hours_back)
+    cutoff = None
+    if hours_back is not None and int(hours_back) > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=int(hours_back))
 
     rows = max(1, min(200, int(max_results)))
     cursor = "*"
@@ -2134,7 +2274,7 @@ def _fetch_recent_openalex_preprint_papers(
                 continue
 
             recency = _openalex_preprint_window_timestamp(paper)
-            if recency < cutoff:
+            if cutoff is not None and recency < cutoff:
                 reached_older_records = True
                 break
 
@@ -2163,6 +2303,20 @@ def _fetch_recent_openalex_preprint_papers(
 
     request_url = "\n".join(request_urls)
     return papers, request_url, raw_count
+
+
+def _fetch_recent_openalex_preprint_papers(
+    source: str,
+    keywords: Sequence[str],
+    hours_back: int,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    return fetch_openalex_preprint_papers(
+        source=source,
+        keywords=keywords,
+        hours_back=hours_back,
+        max_results=max_results,
+    )
 
 
 def fetch_recent_ssrn_papers_openalex(
@@ -2275,6 +2429,22 @@ def fetch_recent_ssrn_papers(
     # SSRN is fetched via Crossref DOI prefix 10.2139.
     query_text = _keywords_to_search_query(keywords)
     return fetch_recent_crossref_preprint_papers(
+        source=SOURCE_SSRN,
+        doi_prefix="10.2139",
+        keywords=keywords,
+        hours_back=hours_back,
+        query_text=query_text,
+        max_results=max_results,
+    )
+
+
+def fetch_ssrn_papers(
+    keywords: Sequence[str],
+    hours_back: Optional[int] = None,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    query_text = _keywords_to_search_query(keywords)
+    return fetch_crossref_preprint_papers(
         source=SOURCE_SSRN,
         doi_prefix="10.2139",
         keywords=keywords,
@@ -2547,9 +2717,9 @@ def fetch_pubmed_articles_by_ids(pubmed_ids: Sequence[str]) -> tuple[list[Paper]
     return papers, response.url
 
 
-def fetch_recent_pubmed_papers(
+def fetch_pubmed_papers(
     query: str,
-    hours_back: int,
+    hours_back: Optional[int] = None,
     max_results: int = DEFAULT_MAX_RESULTS,
 ) -> tuple[list[Paper], str, int]:
     ids, search_url = fetch_pubmed_ids(
@@ -2561,21 +2731,34 @@ def fetch_recent_pubmed_papers(
         return [], search_url, 0
 
     papers, fetch_url = fetch_pubmed_articles_by_ids(ids)
-    now_utc = datetime.now(timezone.utc)
-    cutoff = now_utc - timedelta(hours=hours_back)
-    future_limit = now_utc + timedelta(days=PUBMED_FUTURE_GRACE_DAYS)
-
-    filtered = [
-        paper
-        for paper in papers
-        if cutoff <= paper.published <= future_limit
-    ]
+    filtered = list(papers)
+    if hours_back is not None and int(hours_back) > 0:
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc - timedelta(hours=int(hours_back))
+        future_limit = now_utc + timedelta(days=PUBMED_FUTURE_GRACE_DAYS)
+        filtered = [
+            paper
+            for paper in papers
+            if cutoff <= paper.published <= future_limit
+        ]
     filtered.sort(key=lambda paper: paper.published, reverse=True)
     for idx, paper in enumerate(filtered, start=1):
         paper.index = idx
 
     request_url = search_url if not fetch_url else f"{search_url}\n{fetch_url}"
     return filtered, request_url, len(papers)
+
+
+def fetch_recent_pubmed_papers(
+    query: str,
+    hours_back: int,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    return fetch_pubmed_papers(
+        query=query,
+        hours_back=hours_back,
+        max_results=max_results,
+    )
 
 
 def fetch_arxiv_entries(
@@ -2707,6 +2890,17 @@ def entries_to_recent_papers(
 
         papers.append(paper)
 
+    return papers
+
+
+def entries_to_papers(entries: Sequence[Any]) -> List[Paper]:
+    """Convert arXiv API entries to papers without applying a time cutoff."""
+    papers: List[Paper] = []
+    for entry in entries:
+        paper = entry_to_paper(entry, index=len(papers) + 1)
+        if paper is None:
+            continue
+        papers.append(paper)
     return papers
 
 
@@ -3130,460 +3324,29 @@ async def _delete_temporary_bot_message(
         logger.debug("Could not delete temporary bot message %s in chat %s", message_id, chat_id)
 
 
-async def refresh_cache(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    hours_back: Optional[int] = None,
-    scope: Optional[str] = None,
-) -> List[Paper]:
-    user_id = _get_user_id(update)
-    if user_id is None:
-        raise RuntimeError("Could not determine the Telegram user for this request.")
+def _empty_raw_breakdown() -> dict[str, int]:
+    return {
+        SOURCE_ARXIV: 0,
+        SOURCE_BIORXIV: 0,
+        SOURCE_MEDRXIV: 0,
+        SOURCE_CHEMRXIV: 0,
+        SOURCE_SSRN: 0,
+        SOURCE_IEEE: 0,
+        SOURCE_PUBMED: 0,
+    }
 
-    user_data = context.user_data
-    cached_hours_back = int(user_data.get("cache_hours_back", TODAY_HOURS_BACK))
-    effective_scope = _normalize_search_scope(
-        scope if scope is not None else user_data.get("cache_scope", SEARCH_SCOPE_TODAY)
-    )
-    effective_hours_back = int(hours_back) if hours_back is not None else cached_hours_back
-    keywords_by_source = get_keywords_by_source(user_data=user_data, user_id=user_id)
-    arxiv_keywords = keywords_by_source.get(SOURCE_ARXIV, [])
-    biorxiv_keywords = keywords_by_source.get(SOURCE_BIORXIV, [])
-    medrxiv_keywords = keywords_by_source.get(SOURCE_MEDRXIV, [])
-    chemrxiv_keywords = keywords_by_source.get(SOURCE_CHEMRXIV, [])
-    ssrn_keywords = keywords_by_source.get(SOURCE_SSRN, [])
-    ieee_keywords = keywords_by_source.get(SOURCE_IEEE, [])
-    pubmed_keywords = keywords_by_source.get(SOURCE_PUBMED, [])
+
+def _build_query_lines_for_sources(keywords_by_source: dict[str, Sequence[str]]) -> List[str]:
+    arxiv_keywords = list(keywords_by_source.get(SOURCE_ARXIV, []))
+    biorxiv_keywords = list(keywords_by_source.get(SOURCE_BIORXIV, []))
+    medrxiv_keywords = list(keywords_by_source.get(SOURCE_MEDRXIV, []))
+    chemrxiv_keywords = list(keywords_by_source.get(SOURCE_CHEMRXIV, []))
+    ssrn_keywords = list(keywords_by_source.get(SOURCE_SSRN, []))
+    ieee_keywords = list(keywords_by_source.get(SOURCE_IEEE, []))
+    pubmed_keywords = list(keywords_by_source.get(SOURCE_PUBMED, []))
 
     arxiv_query = build_arxiv_query(keywords=arxiv_keywords)
     pubmed_query = build_pubmed_query(keywords=pubmed_keywords)
-    has_preprint_queries = any(
-        [
-            arxiv_query,
-            biorxiv_keywords,
-            medrxiv_keywords,
-            chemrxiv_keywords,
-            ssrn_keywords,
-            ieee_keywords,
-        ]
-    )
-
-    if not has_preprint_queries and not pubmed_query:
-        user_data["papers"] = []
-        user_data["last_query"] = ""
-        user_data["last_request_url"] = ""
-        user_data["last_raw_entry_count"] = 0
-        user_data["last_raw_entry_breakdown"] = {}
-        user_data["cache_hours_back"] = effective_hours_back
-        user_data["cache_scope"] = effective_scope
-        logger.info("No active query; waiting for keywords")
-        return []
-
-    logger.info(
-        (
-            "Refreshing paper cache for user %s "
-            "(arXiv=%s, bioRxiv=%s, medRxiv=%s, ChemRxiv=%s, SSRN=%s, IEEE=%s, PubMed=%s)"
-        ),
-        user_id,
-        bool(arxiv_query),
-        bool(biorxiv_keywords),
-        bool(medrxiv_keywords),
-        bool(chemrxiv_keywords),
-        bool(ssrn_keywords),
-        bool(ieee_keywords),
-        bool(pubmed_query),
-    )
-
-    fetch_status_message = await _send_fetch_status_message(
-        update,
-        context,
-        hours_back=effective_hours_back,
-        scope=effective_scope,
-    )
-    try:
-        arxiv_papers: List[Paper] = []
-        arxiv_request_url = ""
-        arxiv_raw_count = 0
-        biorxiv_papers: List[Paper] = []
-        biorxiv_request_url = ""
-        biorxiv_raw_count = 0
-        medrxiv_papers: List[Paper] = []
-        medrxiv_request_url = ""
-        medrxiv_raw_count = 0
-        chemrxiv_papers: List[Paper] = []
-        chemrxiv_request_url = ""
-        chemrxiv_raw_count = 0
-        ssrn_papers: List[Paper] = []
-        ssrn_request_url = ""
-        ssrn_raw_count = 0
-        ieee_papers: List[Paper] = []
-        ieee_request_url = ""
-        ieee_raw_count = 0
-        preprint_fetches: List[tuple[str, Any]] = []
-        if arxiv_query:
-            preprint_fetches.append(
-                (
-                    SOURCE_ARXIV,
-                    asyncio.to_thread(
-                        fetch_arxiv_entries,
-                        arxiv_query,
-                        DEFAULT_MAX_RESULTS,
-                        "lastUpdatedDate" if effective_scope == SEARCH_SCOPE_TODAY else "submittedDate",
-                    ),
-                )
-            )
-        if biorxiv_keywords:
-            preprint_fetches.append(
-                (
-                    SOURCE_BIORXIV,
-                    asyncio.to_thread(
-                        fetch_recent_rxiv_papers,
-                        SOURCE_BIORXIV,
-                        biorxiv_keywords,
-                        effective_hours_back,
-                        DEFAULT_MAX_RESULTS,
-                    ),
-                )
-            )
-        if medrxiv_keywords:
-            preprint_fetches.append(
-                (
-                    SOURCE_MEDRXIV,
-                    asyncio.to_thread(
-                        fetch_recent_rxiv_papers,
-                        SOURCE_MEDRXIV,
-                        medrxiv_keywords,
-                        effective_hours_back,
-                        DEFAULT_MAX_RESULTS,
-                    ),
-                )
-            )
-        if chemrxiv_keywords:
-            preprint_fetches.append(
-                (
-                    SOURCE_CHEMRXIV,
-                    asyncio.to_thread(
-                        fetch_recent_chemrxiv_papers,
-                        chemrxiv_keywords,
-                        effective_hours_back,
-                        DEFAULT_MAX_RESULTS,
-                    ),
-                )
-            )
-        if ssrn_keywords:
-            preprint_fetches.append(
-                (
-                    SOURCE_SSRN,
-                    asyncio.to_thread(
-                        fetch_recent_ssrn_papers,
-                        ssrn_keywords,
-                        effective_hours_back,
-                        DEFAULT_MAX_RESULTS,
-                    ),
-                )
-            )
-        if ieee_keywords:
-            preprint_fetches.append(
-                (
-                    SOURCE_IEEE,
-                    asyncio.to_thread(
-                        fetch_recent_ieee_papers,
-                        ieee_keywords,
-                        effective_hours_back,
-                        DEFAULT_MAX_RESULTS,
-                    ),
-                )
-            )
-        if preprint_fetches:
-            preprint_results = await asyncio.gather(
-                *(task for _source, task in preprint_fetches),
-                return_exceptions=True,
-            )
-            for (source, _task), result in zip(preprint_fetches, preprint_results):
-                if isinstance(result, Exception):
-                    logger.warning("%s fetch failed: %s", paper_source_label(source), result)
-                    continue
-                if source == SOURCE_ARXIV:
-                    entries, arxiv_request_url = result
-                    arxiv_raw_count = len(entries)
-                    if effective_scope == SEARCH_SCOPE_TODAY:
-                        arxiv_papers = entries_to_recent_papers(
-                            entries,
-                            TODAY_HOURS_BACK,
-                            use_updated=True,
-                        )
-                    else:
-                        arxiv_papers = entries_to_recent_papers(entries, effective_hours_back)
-                    continue
-                if source == SOURCE_BIORXIV:
-                    biorxiv_papers, biorxiv_request_url, biorxiv_raw_count = result
-                    continue
-                if source == SOURCE_MEDRXIV:
-                    medrxiv_papers, medrxiv_request_url, medrxiv_raw_count = result
-                    continue
-                if source == SOURCE_CHEMRXIV:
-                    chemrxiv_papers, chemrxiv_request_url, chemrxiv_raw_count = result
-                    continue
-                if source == SOURCE_SSRN:
-                    ssrn_papers, ssrn_request_url, ssrn_raw_count = result
-                    continue
-                if source == SOURCE_IEEE:
-                    ieee_papers, ieee_request_url, ieee_raw_count = result
-                    continue
-        pubmed_papers: List[Paper] = []
-        pubmed_request_url = ""
-        pubmed_raw_count = 0
-        if pubmed_query:
-            pubmed_papers, pubmed_request_url, pubmed_raw_count = await asyncio.to_thread(
-                fetch_recent_pubmed_papers,
-                pubmed_query,
-                effective_hours_back,
-                DEFAULT_MAX_RESULTS,
-            )
-
-        papers = (
-            arxiv_papers
-            + biorxiv_papers
-            + medrxiv_papers
-            + chemrxiv_papers
-            + ssrn_papers
-            + ieee_papers
-            + pubmed_papers
-        )
-        papers.sort(
-            key=lambda paper: _paper_recency_timestamp(
-                paper,
-                prefer_updated_for_arxiv=effective_scope == SEARCH_SCOPE_TODAY,
-            ),
-            reverse=True,
-        )
-        for idx, paper in enumerate(papers, start=1):
-            paper.index = idx
-
-        query_lines: List[str] = []
-        if arxiv_query:
-            query_lines.append(f"arXiv: {arxiv_query}")
-        if biorxiv_keywords:
-            query_lines.append(f"bioRxiv keywords: {', '.join(biorxiv_keywords)}")
-        if medrxiv_keywords:
-            query_lines.append(f"medRxiv keywords: {', '.join(medrxiv_keywords)}")
-        if chemrxiv_keywords:
-            query_lines.append(f"ChemRxiv keywords: {', '.join(chemrxiv_keywords)}")
-        if ssrn_keywords:
-            query_lines.append(f"SSRN keywords: {', '.join(ssrn_keywords)}")
-        if ieee_keywords:
-            query_lines.append(f"IEEE keywords: {', '.join(ieee_keywords)}")
-        if pubmed_query:
-            query_lines.append(f"PubMed: {pubmed_query}")
-
-        request_lines: List[str] = []
-        if arxiv_request_url:
-            request_lines.append(f"arXiv: {arxiv_request_url}")
-        if biorxiv_request_url:
-            request_lines.append(f"bioRxiv: {biorxiv_request_url}")
-        if medrxiv_request_url:
-            request_lines.append(f"medRxiv: {medrxiv_request_url}")
-        if chemrxiv_request_url:
-            request_lines.append(f"ChemRxiv: {chemrxiv_request_url}")
-        if ssrn_request_url:
-            request_lines.append(f"SSRN: {ssrn_request_url}")
-        if ieee_request_url:
-            request_lines.append(f"IEEE: {ieee_request_url}")
-        if pubmed_request_url:
-            request_lines.append(f"PubMed: {pubmed_request_url}")
-
-        raw_breakdown = {
-            "arxiv": arxiv_raw_count,
-            "biorxiv": biorxiv_raw_count,
-            "medrxiv": medrxiv_raw_count,
-            "chemrxiv": chemrxiv_raw_count,
-            "ssrn": ssrn_raw_count,
-            "ieee": ieee_raw_count,
-            "pubmed": pubmed_raw_count,
-        }
-        raw_total = (
-            arxiv_raw_count
-            + biorxiv_raw_count
-            + medrxiv_raw_count
-            + chemrxiv_raw_count
-            + ssrn_raw_count
-            + ieee_raw_count
-            + pubmed_raw_count
-        )
-
-        user_data["papers"] = papers
-        user_data["last_query"] = "\n".join(query_lines)
-        user_data["last_request_url"] = "\n".join(request_lines)
-        user_data["last_refresh_utc"] = datetime.now(timezone.utc)
-        user_data["last_raw_entry_count"] = raw_total
-        user_data["last_raw_entry_breakdown"] = raw_breakdown
-        user_data["cache_hours_back"] = effective_hours_back
-        user_data["cache_scope"] = effective_scope
-        user_data["results_token"] = int(user_data.get("results_token", 0) or 0) + 1
-        return papers
-    finally:
-        await _delete_temporary_bot_message(context, fetch_status_message)
-
-
-async def fetch_recent_papers_for_user(
-    user_id: int,
-    hours_back: int,
-) -> tuple[list[Paper], str, int, dict[str, int]]:
-    arxiv_keywords = get_keywords_for_source(SOURCE_ARXIV, user_id=user_id)
-    biorxiv_keywords = get_keywords_for_source(SOURCE_BIORXIV, user_id=user_id)
-    medrxiv_keywords = get_keywords_for_source(SOURCE_MEDRXIV, user_id=user_id)
-    chemrxiv_keywords = get_keywords_for_source(SOURCE_CHEMRXIV, user_id=user_id)
-    ssrn_keywords = get_keywords_for_source(SOURCE_SSRN, user_id=user_id)
-    ieee_keywords = get_keywords_for_source(SOURCE_IEEE, user_id=user_id)
-    pubmed_keywords = get_keywords_for_pubmed(user_id=user_id)
-    arxiv_query = build_arxiv_query(keywords=arxiv_keywords)
-    pubmed_query = build_pubmed_query(keywords=pubmed_keywords)
-    has_preprint_queries = any(
-        [
-            arxiv_query,
-            biorxiv_keywords,
-            medrxiv_keywords,
-            chemrxiv_keywords,
-            ssrn_keywords,
-            ieee_keywords,
-        ]
-    )
-    if not has_preprint_queries and not pubmed_query:
-        return [], "", 0, {}
-
-    arxiv_papers: List[Paper] = []
-    arxiv_raw = 0
-    biorxiv_papers: List[Paper] = []
-    biorxiv_raw = 0
-    medrxiv_papers: List[Paper] = []
-    medrxiv_raw = 0
-    chemrxiv_papers: List[Paper] = []
-    chemrxiv_raw = 0
-    ssrn_papers: List[Paper] = []
-    ssrn_raw = 0
-    ieee_papers: List[Paper] = []
-    ieee_raw = 0
-    preprint_fetches: List[tuple[str, Any]] = []
-    if arxiv_query:
-        preprint_fetches.append(
-            (
-                SOURCE_ARXIV,
-                asyncio.to_thread(
-                    fetch_arxiv_entries,
-                    arxiv_query,
-                    DEFAULT_MAX_RESULTS,
-                    "lastUpdatedDate",
-                ),
-            )
-        )
-    if biorxiv_keywords:
-        preprint_fetches.append(
-            (
-                SOURCE_BIORXIV,
-                asyncio.to_thread(
-                    fetch_recent_rxiv_papers,
-                    SOURCE_BIORXIV,
-                    biorxiv_keywords,
-                    hours_back,
-                    DEFAULT_MAX_RESULTS,
-                ),
-            )
-        )
-    if medrxiv_keywords:
-        preprint_fetches.append(
-            (
-                SOURCE_MEDRXIV,
-                asyncio.to_thread(
-                    fetch_recent_rxiv_papers,
-                    SOURCE_MEDRXIV,
-                    medrxiv_keywords,
-                    hours_back,
-                    DEFAULT_MAX_RESULTS,
-                ),
-            )
-        )
-    if chemrxiv_keywords:
-        preprint_fetches.append(
-            (
-                SOURCE_CHEMRXIV,
-                asyncio.to_thread(
-                    fetch_recent_chemrxiv_papers,
-                    chemrxiv_keywords,
-                    hours_back,
-                    DEFAULT_MAX_RESULTS,
-                ),
-            )
-        )
-    if ssrn_keywords:
-        preprint_fetches.append(
-            (
-                SOURCE_SSRN,
-                asyncio.to_thread(
-                    fetch_recent_ssrn_papers,
-                    ssrn_keywords,
-                    hours_back,
-                    DEFAULT_MAX_RESULTS,
-                ),
-            )
-        )
-    if ieee_keywords:
-        preprint_fetches.append(
-            (
-                SOURCE_IEEE,
-                asyncio.to_thread(
-                    fetch_recent_ieee_papers,
-                    ieee_keywords,
-                    hours_back,
-                    DEFAULT_MAX_RESULTS,
-                ),
-            )
-        )
-    if preprint_fetches:
-        preprint_results = await asyncio.gather(
-            *(task for _source, task in preprint_fetches),
-            return_exceptions=True,
-        )
-        for (source, _task), result in zip(preprint_fetches, preprint_results):
-            if isinstance(result, Exception):
-                logger.warning("%s fetch failed for recap: %s", paper_source_label(source), result)
-                continue
-            if source == SOURCE_ARXIV:
-                entries, _arxiv_url = result
-                arxiv_raw = len(entries)
-                arxiv_papers = entries_to_recent_papers(entries, hours_back, use_updated=True)
-                continue
-            if source == SOURCE_BIORXIV:
-                biorxiv_papers, _biorxiv_url, biorxiv_raw = result
-                continue
-            if source == SOURCE_MEDRXIV:
-                medrxiv_papers, _medrxiv_url, medrxiv_raw = result
-                continue
-            if source == SOURCE_CHEMRXIV:
-                chemrxiv_papers, _chemrxiv_url, chemrxiv_raw = result
-                continue
-            if source == SOURCE_SSRN:
-                ssrn_papers, _ssrn_url, ssrn_raw = result
-                continue
-            if source == SOURCE_IEEE:
-                ieee_papers, _ieee_url, ieee_raw = result
-                continue
-    pubmed_papers: List[Paper] = []
-    pubmed_raw = 0
-    if pubmed_query:
-        pubmed_papers, _pubmed_url, pubmed_raw = await asyncio.to_thread(
-            fetch_recent_pubmed_papers,
-            pubmed_query,
-            hours_back,
-            DEFAULT_MAX_RESULTS,
-        )
-
-    papers = arxiv_papers + biorxiv_papers + medrxiv_papers + chemrxiv_papers + ssrn_papers + ieee_papers + pubmed_papers
-    papers.sort(
-        key=lambda paper: _paper_recency_timestamp(paper, prefer_updated_for_arxiv=True),
-        reverse=True,
-    )
-    for idx, paper in enumerate(papers, start=1):
-        paper.index = idx
 
     query_lines: List[str] = []
     if arxiv_query:
@@ -3600,18 +3363,291 @@ async def fetch_recent_papers_for_user(
         query_lines.append(f"IEEE keywords: {', '.join(ieee_keywords)}")
     if pubmed_query:
         query_lines.append(f"PubMed: {pubmed_query}")
+    return query_lines
 
-    raw_breakdown = {
-        "arxiv": arxiv_raw,
-        "biorxiv": biorxiv_raw,
-        "medrxiv": medrxiv_raw,
-        "chemrxiv": chemrxiv_raw,
-        "ssrn": ssrn_raw,
-        "ieee": ieee_raw,
-        "pubmed": pubmed_raw,
+
+def _store_search_cache(
+    user_data: dict[str, Any],
+    *,
+    papers: Sequence[Paper],
+    query_text: str,
+    request_text: str,
+    raw_total: int,
+    raw_breakdown: dict[str, int],
+    hours_back: int,
+    scope: str,
+) -> int:
+    user_data["papers"] = list(papers)
+    user_data["last_query"] = query_text
+    user_data["last_request_url"] = request_text
+    user_data["last_refresh_utc"] = datetime.now(timezone.utc)
+    user_data["last_raw_entry_count"] = raw_total
+    user_data["last_raw_entry_breakdown"] = dict(raw_breakdown)
+    user_data["cache_hours_back"] = int(hours_back)
+    user_data["cache_scope"] = _normalize_search_scope(scope)
+    user_data["results_token"] = int(user_data.get("results_token", 0) or 0) + 1
+    return int(user_data["results_token"])
+
+
+async def _fetch_papers_for_keywords_by_source(
+    *,
+    keywords_by_source: dict[str, Sequence[str]],
+    hours_back: int,
+    scope: str,
+) -> tuple[list[Paper], str, str, int, dict[str, int]]:
+    effective_scope = _normalize_search_scope(scope)
+    effective_hours_back = int(hours_back)
+    source_queries = {
+        source: list(keywords_by_source.get(source, []))
+        for source in keyword_sources()
     }
-    raw_total = arxiv_raw + biorxiv_raw + medrxiv_raw + chemrxiv_raw + ssrn_raw + ieee_raw + pubmed_raw
-    return papers, "\n".join(query_lines), raw_total, raw_breakdown
+    arxiv_keywords = source_queries[SOURCE_ARXIV]
+    pubmed_keywords = source_queries[SOURCE_PUBMED]
+    arxiv_query = build_arxiv_query(keywords=arxiv_keywords)
+    pubmed_query = build_pubmed_query(keywords=pubmed_keywords)
+    has_any_query = bool(arxiv_query or pubmed_query or any(source_queries[source] for source in keyword_sources() if source != SOURCE_ARXIV and source != SOURCE_PUBMED))
+    if not has_any_query:
+        return [], "", "", 0, _empty_raw_breakdown()
+
+    request_urls_by_source: dict[str, str] = {}
+    raw_breakdown = _empty_raw_breakdown()
+    papers_by_source: dict[str, list[Paper]] = {source: [] for source in keyword_sources()}
+    fetch_hours_back = None if effective_scope == SEARCH_SCOPE_GLOBAL else effective_hours_back
+
+    preprint_fetches: List[tuple[str, Any]] = []
+    if arxiv_query:
+        preprint_fetches.append(
+            (
+                SOURCE_ARXIV,
+                asyncio.to_thread(
+                    fetch_arxiv_entries,
+                    arxiv_query,
+                    DEFAULT_MAX_RESULTS,
+                    "lastUpdatedDate" if effective_scope == SEARCH_SCOPE_TODAY else "submittedDate",
+                ),
+            )
+        )
+    if source_queries[SOURCE_BIORXIV]:
+        preprint_fetches.append(
+            (
+                SOURCE_BIORXIV,
+                asyncio.to_thread(
+                    fetch_rxiv_papers,
+                    SOURCE_BIORXIV,
+                    source_queries[SOURCE_BIORXIV],
+                    fetch_hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if source_queries[SOURCE_MEDRXIV]:
+        preprint_fetches.append(
+            (
+                SOURCE_MEDRXIV,
+                asyncio.to_thread(
+                    fetch_rxiv_papers,
+                    SOURCE_MEDRXIV,
+                    source_queries[SOURCE_MEDRXIV],
+                    fetch_hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if source_queries[SOURCE_CHEMRXIV]:
+        preprint_fetches.append(
+            (
+                SOURCE_CHEMRXIV,
+                asyncio.to_thread(
+                    fetch_chemrxiv_papers,
+                    source_queries[SOURCE_CHEMRXIV],
+                    fetch_hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if source_queries[SOURCE_SSRN]:
+        preprint_fetches.append(
+            (
+                SOURCE_SSRN,
+                asyncio.to_thread(
+                    fetch_ssrn_papers,
+                    source_queries[SOURCE_SSRN],
+                    fetch_hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if source_queries[SOURCE_IEEE]:
+        preprint_fetches.append(
+            (
+                SOURCE_IEEE,
+                asyncio.to_thread(
+                    fetch_ieee_papers,
+                    source_queries[SOURCE_IEEE],
+                    fetch_hours_back,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+
+    if preprint_fetches:
+        preprint_results = await asyncio.gather(
+            *(task for _source, task in preprint_fetches),
+            return_exceptions=True,
+        )
+        for (source, _task), result in zip(preprint_fetches, preprint_results):
+            if isinstance(result, Exception):
+                logger.warning("%s fetch failed: %s", paper_source_label(source), result)
+                continue
+            if source == SOURCE_ARXIV:
+                entries, request_url = result
+                request_urls_by_source[source] = request_url
+                raw_breakdown[source] = len(entries)
+                if effective_scope == SEARCH_SCOPE_TODAY:
+                    papers_by_source[source] = entries_to_recent_papers(
+                        entries,
+                        TODAY_HOURS_BACK,
+                        use_updated=True,
+                    )
+                elif effective_scope == SEARCH_SCOPE_GLOBAL:
+                    papers_by_source[source] = entries_to_papers(entries)
+                else:
+                    papers_by_source[source] = entries_to_recent_papers(entries, effective_hours_back)
+                continue
+
+            source_papers, request_url, raw_count = result
+            papers_by_source[source] = source_papers
+            request_urls_by_source[source] = request_url
+            raw_breakdown[source] = int(raw_count)
+
+    if pubmed_query:
+        try:
+            pubmed_papers, pubmed_request_url, pubmed_raw_count = await asyncio.to_thread(
+                fetch_pubmed_papers,
+                pubmed_query,
+                fetch_hours_back,
+                DEFAULT_MAX_RESULTS,
+            )
+            papers_by_source[SOURCE_PUBMED] = pubmed_papers
+            request_urls_by_source[SOURCE_PUBMED] = pubmed_request_url
+            raw_breakdown[SOURCE_PUBMED] = int(pubmed_raw_count)
+        except Exception as exc:
+            logger.warning("%s fetch failed: %s", paper_source_label(SOURCE_PUBMED), exc)
+
+    papers = [
+        paper
+        for source in keyword_sources()
+        for paper in papers_by_source.get(source, [])
+    ]
+    papers.sort(
+        key=lambda paper: _paper_recency_timestamp(
+            paper,
+            prefer_updated_for_arxiv=effective_scope == SEARCH_SCOPE_TODAY,
+        ),
+        reverse=True,
+    )
+    for idx, paper in enumerate(papers, start=1):
+        paper.index = idx
+
+    query_lines = _build_query_lines_for_sources(source_queries)
+    request_lines = [
+        f"{paper_source_label(source)}: {request_urls_by_source[source]}"
+        for source in keyword_sources()
+        if request_urls_by_source.get(source)
+    ]
+    raw_total = sum(int(value) for value in raw_breakdown.values())
+    return papers, "\n".join(query_lines), "\n".join(request_lines), raw_total, raw_breakdown
+
+
+async def refresh_cache(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    hours_back: Optional[int] = None,
+    scope: Optional[str] = None,
+) -> List[Paper]:
+    user_id = _get_user_id(update)
+    if user_id is None:
+        raise RuntimeError("Could not determine the Telegram user for this request.")
+
+    user_data = context.user_data
+    cached_hours_back = int(user_data.get("cache_hours_back", TODAY_HOURS_BACK))
+    effective_scope = _normalize_search_scope(
+        scope if scope is not None else user_data.get("cache_scope", SEARCH_SCOPE_TODAY)
+    )
+    effective_hours_back = 0 if effective_scope == SEARCH_SCOPE_GLOBAL else int(hours_back) if hours_back is not None else cached_hours_back
+    keywords_by_source = get_keywords_by_source(user_data=user_data, user_id=user_id)
+    query_lines = _build_query_lines_for_sources(keywords_by_source)
+    if not query_lines:
+        _store_search_cache(
+            user_data,
+            papers=[],
+            query_text="",
+            request_text="",
+            raw_total=0,
+            raw_breakdown=_empty_raw_breakdown(),
+            hours_back=effective_hours_back,
+            scope=effective_scope,
+        )
+        logger.info("No active query; waiting for keywords")
+        return []
+
+    logger.info(
+        (
+            "Refreshing paper cache for user %s "
+            "(scope=%s, arXiv=%s, bioRxiv=%s, medRxiv=%s, ChemRxiv=%s, SSRN=%s, IEEE=%s, PubMed=%s)"
+        ),
+        user_id,
+        effective_scope,
+        bool(keywords_by_source.get(SOURCE_ARXIV)),
+        bool(keywords_by_source.get(SOURCE_BIORXIV)),
+        bool(keywords_by_source.get(SOURCE_MEDRXIV)),
+        bool(keywords_by_source.get(SOURCE_CHEMRXIV)),
+        bool(keywords_by_source.get(SOURCE_SSRN)),
+        bool(keywords_by_source.get(SOURCE_IEEE)),
+        bool(keywords_by_source.get(SOURCE_PUBMED)),
+    )
+
+    fetch_status_message = await _send_fetch_status_message(
+        update,
+        context,
+        hours_back=effective_hours_back,
+        scope=effective_scope,
+    )
+    try:
+        papers, query_text, request_text, raw_total, raw_breakdown = await _fetch_papers_for_keywords_by_source(
+            keywords_by_source=keywords_by_source,
+            hours_back=effective_hours_back,
+            scope=effective_scope,
+        )
+        _store_search_cache(
+            user_data,
+            papers=papers,
+            query_text=query_text,
+            request_text=request_text,
+            raw_total=raw_total,
+            raw_breakdown=raw_breakdown,
+            hours_back=effective_hours_back,
+            scope=effective_scope,
+        )
+        return papers
+    finally:
+        await _delete_temporary_bot_message(context, fetch_status_message)
+
+
+async def fetch_recent_papers_for_user(
+    user_id: int,
+    hours_back: int,
+) -> tuple[list[Paper], str, int, dict[str, int]]:
+    keywords_by_source = {
+        source: get_keywords_for_source(source, user_id=user_id)
+        for source in keyword_sources()
+    }
+    papers, query_text, _request_text, raw_total, raw_breakdown = await _fetch_papers_for_keywords_by_source(
+        keywords_by_source=keywords_by_source,
+        hours_back=hours_back,
+        scope=SEARCH_SCOPE_TODAY,
+    )
+    return papers, query_text, raw_total, raw_breakdown
 
 
 async def send_daily_recap_for_user(
@@ -3731,10 +3767,14 @@ def get_cached_papers(
     hours_back: Optional[int] = None,
     scope: Optional[str] = None,
 ) -> List[Paper]:
-    expected_hours = int(hours_back) if hours_back is not None else TODAY_HOURS_BACK
+    expected_scope = _normalize_search_scope(scope if scope is not None else SEARCH_SCOPE_TODAY)
+    expected_hours = (
+        0
+        if expected_scope == SEARCH_SCOPE_GLOBAL
+        else int(hours_back) if hours_back is not None else TODAY_HOURS_BACK
+    )
     if context.user_data.get("cache_hours_back") != expected_hours:
         return []
-    expected_scope = _normalize_search_scope(scope if scope is not None else SEARCH_SCOPE_TODAY)
     cached_scope = _normalize_search_scope(context.user_data.get("cache_scope", SEARCH_SCOPE_TODAY))
     if cached_scope != expected_scope:
         return []
@@ -3843,7 +3883,7 @@ def build_help_text() -> str:
         '• List example: <code>- quantum mechanics\n- entanglement + superconductivity</code>\n\n'
         "<b>Other</b>\n"
         f"• <b>{html.escape(MENU_BTN_HELP)}</b>: show this guide\n"
-        f"• <b>{html.escape(MENU_BTN_MORE)}</b>: open feedback and support options"
+        f"• <b>{html.escape(MENU_BTN_MORE)}</b>: open {html.escape(MENU_BTN_GLOBAL_SEARCH)}, feedback, and support options"
     )
 
 
@@ -3861,6 +3901,230 @@ async def prompt_more_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             text=MORE_MENU_MESSAGE_TEXT,
             reply_markup=build_more_menu_markup(),
         )
+
+
+def _normalize_global_search_sources(raw_sources: Sequence[Any]) -> List[str]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for item in raw_sources:
+        source = normalize_text(str(item or "")).casefold()
+        if source not in ALL_PAPER_SOURCES or source in seen:
+            continue
+        seen.add(source)
+        normalized.append(source)
+    return normalized
+
+
+def _get_global_search_sources(context: ContextTypes.DEFAULT_TYPE) -> List[str]:
+    cached = context.user_data.get("global_search_selected_sources", [])
+    if not isinstance(cached, Sequence) or isinstance(cached, (str, bytes, bytearray)):
+        return []
+    return _normalize_global_search_sources(cached)
+
+
+def _global_search_sources_label(sources: Sequence[str]) -> str:
+    labels = [paper_source_label(source) for source in _normalize_global_search_sources(sources)]
+    if not labels:
+        return "no journals"
+    return ", ".join(labels)
+
+
+def _clear_global_search_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("awaiting_global_search_query", None)
+    context.user_data.pop("global_search_selected_sources", None)
+
+
+async def _show_global_search_source_picker(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    selected_sources: Optional[Sequence[str]] = None,
+) -> None:
+    selected = _normalize_global_search_sources(
+        selected_sources if selected_sources is not None else _get_global_search_sources(context)
+    )
+    context.user_data["global_search_selected_sources"] = selected
+    text = (
+        "<b>Global Search</b>\n\n"
+        "Choose one or more journals, then tap <b>Search</b>."
+    )
+    markup = build_global_search_sources_markup(selected)
+    query = update.callback_query
+    chat = update.effective_chat
+    if query is not None and query.message is not None:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if update.message is not None:
+        await update.message.reply_text(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if chat is not None:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def _prompt_global_search_query(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    selected_sources: Sequence[str],
+) -> None:
+    selected = _normalize_global_search_sources(selected_sources)
+    if not selected:
+        return
+    _clear_pending_input_flags(context)
+    context.user_data["global_search_selected_sources"] = selected
+    context.user_data["awaiting_global_search_query"] = True
+
+    query = update.callback_query
+    if query is not None and query.message is not None:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            logger.exception("Could not clear Global Search source picker markup")
+
+    chat = update.effective_chat
+    text = (
+        "<b>Global Search</b>\n\n"
+        f"<b>Selected journals</b>: {html.escape(_global_search_sources_label(selected))}\n\n"
+        "Send your query now.\n"
+        "Use commas or separate lines for OR.\n"
+        "Use <code>+</code> inside one entry for AND.\n\n"
+        "<b>Examples</b>\n"
+        "<code>graph neural networks</code>\n"
+        "<code>quantum mechanics + entanglement, superconductivity</code>\n"
+        "<code>- llm safety\n- retrieval + benchmark</code>"
+    )
+    if chat is not None:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            reply_markup=build_main_menu_markup(),
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def apply_global_search_query_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw: str,
+) -> bool:
+    message = update.message
+    user_id = _get_user_id(update)
+    if message is None or user_id is None:
+        return False
+
+    selected_sources = _get_global_search_sources(context)
+    if not selected_sources:
+        await message.reply_text(
+            f"Choose journals first from {MENU_BTN_MORE} > {MENU_BTN_GLOBAL_SEARCH}.",
+            reply_markup=build_main_menu_markup(),
+        )
+        _clear_global_search_state(context)
+        return False
+
+    parsed_keywords = parse_keywords_input(raw)
+    if not parsed_keywords:
+        await message.reply_text(
+            "No valid query terms found. Send at least one keyword or phrase.",
+            reply_markup=build_main_menu_markup(),
+        )
+        return False
+
+    keywords_by_source = {
+        source: list(parsed_keywords)
+        for source in selected_sources
+    }
+    fetch_status_message = await _send_fetch_status_message(
+        update,
+        context,
+        hours_back=0,
+        scope=SEARCH_SCOPE_GLOBAL,
+    )
+    try:
+        papers, query_text, request_text, raw_total, raw_breakdown = await _fetch_papers_for_keywords_by_source(
+            keywords_by_source=keywords_by_source,
+            hours_back=0,
+            scope=SEARCH_SCOPE_GLOBAL,
+        )
+    except Exception as exc:
+        logger.exception("Global Search failed")
+        await message.reply_text(
+            f"Could not run Global Search:\n{exc}",
+            reply_markup=build_main_menu_markup(),
+        )
+        return False
+    finally:
+        await _delete_temporary_bot_message(context, fetch_status_message)
+
+    results_token = _store_search_cache(
+        context.user_data,
+        papers=papers,
+        query_text=query_text,
+        request_text=request_text,
+        raw_total=raw_total,
+        raw_breakdown=raw_breakdown,
+        hours_back=0,
+        scope=SEARCH_SCOPE_GLOBAL,
+    )
+    _clear_global_search_state(context)
+
+    if not papers:
+        await message.reply_text(
+            (
+                f"No matching papers found in {_describe_search_window(SEARCH_SCOPE_GLOBAL, 0)}.\n\n"
+                f"Searched journals: {_global_search_sources_label(selected_sources)}.\n"
+                f"Review your query and try {MENU_BTN_GLOBAL_SEARCH} again."
+            ),
+            reply_markup=build_main_menu_markup(),
+        )
+        return True
+
+    await message.reply_text(
+        (
+            f"{len(papers)} matching paper(s) found in "
+            f"{_describe_search_window(SEARCH_SCOPE_GLOBAL, 0)}.\n"
+            f"Searched journals: {_global_search_sources_label(selected_sources)}."
+        ),
+        reply_markup=build_main_menu_markup(),
+    )
+
+    async def send_text(
+        text: str,
+        *,
+        reply_markup: Optional[Any] = None,
+        parse_mode: Optional[str] = None,
+        disable_web_page_preview: Optional[bool] = None,
+    ) -> None:
+        await message.reply_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+
+    await send_results_page(
+        send_text,
+        context=context,
+        papers=papers,
+        user_id=user_id,
+        hours_back=0,
+        scope=SEARCH_SCOPE_GLOBAL,
+        results_token=results_token,
+        start_index=0,
+    )
+    return True
 
 
 async def _send_coffee_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3967,6 +4231,11 @@ async def more_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     action = data.removeprefix("moremenu:").strip().casefold()
+    if action == "globalsearch":
+        await query.answer()
+        await _show_global_search_source_picker(update, context, selected_sources=[])
+        return
+
     await query.answer()
     if query.message is not None:
         try:
@@ -3980,6 +4249,73 @@ async def more_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if action == "coffee":
         await _send_coffee_message(update, context)
         return
+
+
+async def global_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    data = query.data or ""
+    if not data.startswith("gsearch:"):
+        await query.answer()
+        return
+
+    selected_sources = _get_global_search_sources(context)
+    if data.startswith("gsearch:toggle:"):
+        source = normalize_text(data.removeprefix("gsearch:toggle:")).casefold()
+        if source not in ALL_PAPER_SOURCES:
+            await query.answer("Invalid journal.", show_alert=True)
+            return
+        if source in selected_sources:
+            selected_sources = [item for item in selected_sources if item != source]
+            await query.answer(f"Removed {paper_source_label(source)}")
+        else:
+            selected_sources.append(source)
+            await query.answer(f"Added {paper_source_label(source)}")
+        await _show_global_search_source_picker(update, context, selected_sources=selected_sources)
+        return
+
+    if data == "gsearch:all":
+        await query.answer("All journals selected")
+        await _show_global_search_source_picker(update, context, selected_sources=keyword_sources())
+        return
+
+    if data == "gsearch:clear":
+        await query.answer("Selection cleared")
+        await _show_global_search_source_picker(update, context, selected_sources=[])
+        return
+
+    if data == "gsearch:start":
+        if not selected_sources:
+            await query.answer("Choose at least one journal first.", show_alert=True)
+            return
+        await query.answer("Send your query")
+        await _prompt_global_search_query(
+            update,
+            context,
+            selected_sources=selected_sources,
+        )
+        return
+
+    if data == "gsearch:cancel":
+        _clear_global_search_state(context)
+        await query.answer("Global Search cancelled")
+        if query.message is not None:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                logger.exception("Could not clear Global Search markup on cancel")
+        chat = update.effective_chat
+        if chat is not None:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="Global Search cancelled.",
+                reply_markup=build_main_menu_markup(),
+            )
+        return
+
+    await query.answer("Unknown Global Search action.", show_alert=True)
 
 
 async def apply_report_input(
@@ -4160,6 +4496,7 @@ def _clear_pending_input_flags(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_recap_timezone_input", None)
     context.user_data.pop("awaiting_recap_time_input", None)
     context.user_data.pop("awaiting_report_input", None)
+    _clear_global_search_state(context)
     context.user_data.pop("pending_recap_timezone", None)
 
 
@@ -4341,7 +4678,7 @@ def build_more_results_markup(
 ) -> InlineKeyboardMarkup:
     """Build the inline keyboard used to request the next page of results."""
     safe_scope = _normalize_search_scope(scope)
-    safe_hours = max(1, int(hours_back))
+    safe_hours = 0 if safe_scope == SEARCH_SCOPE_GLOBAL else max(1, int(hours_back))
     safe_offset = max(0, int(offset))
     safe_token = max(0, int(results_token))
     return InlineKeyboardMarkup(
@@ -5545,7 +5882,14 @@ async def more_results_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("This results page is invalid.", show_alert=True)
         return
 
-    if hours_back <= 0 or offset < 0:
+    if offset < 0:
+        await query.answer("This results page is invalid.", show_alert=True)
+        return
+    if scope == SEARCH_SCOPE_GLOBAL:
+        if hours_back != 0:
+            await query.answer("This results page is invalid.", show_alert=True)
+            return
+    elif hours_back <= 0:
         await query.answer("This results page is invalid.", show_alert=True)
         return
 
@@ -5636,6 +5980,7 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "awaiting_recap_timezone_input",
         "awaiting_recap_time_input",
         "awaiting_report_input",
+        "awaiting_global_search_query",
     ]
     has_pending_action = any(context.user_data.get(flag, False) for flag in pending_flags)
 
@@ -5699,6 +6044,12 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if context.user_data.get("awaiting_report_input", False):
         await apply_report_input(update, context, text)
         context.user_data.pop("awaiting_report_input", None)
+        return
+
+    if context.user_data.get("awaiting_global_search_query", False):
+        success = await apply_global_search_query_input(update, context, text)
+        if success:
+            context.user_data.pop("awaiting_global_search_query", None)
         return
 
     await message.reply_text(
@@ -6168,6 +6519,7 @@ def main() -> None:
     app.add_handler(CommandHandler("refresh", refresh_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_router))
     app.add_handler(CallbackQueryHandler(more_menu_callback, pattern=r"^moremenu:"))
+    app.add_handler(CallbackQueryHandler(global_search_callback, pattern=r"^gsearch:"))
     app.add_handler(CallbackQueryHandler(recap_timezone_callback, pattern=r"^rtz"))
     app.add_handler(CallbackQueryHandler(keyword_scope_callback, pattern=r"^kwmenu:"))
     app.add_handler(CallbackQueryHandler(open_matches_callback, pattern=r"^open_matches:"))
