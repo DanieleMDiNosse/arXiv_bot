@@ -229,20 +229,22 @@ def get_report_forward_chat_id() -> Optional[int]:
     return chat_ids[0] if chat_ids else None
 
 
+def get_report_admin_user_ids() -> List[int]:
+    return _parse_report_chat_ids(
+        REPORT_ADMIN_USER_ID,
+        source_name="REPORT_ADMIN_USER_ID",
+    )
+
+
 def get_report_admin_user_id() -> Optional[int]:
-    raw_value = REPORT_ADMIN_USER_ID
-    if not raw_value:
-        return None
-    try:
-        return int(raw_value)
-    except ValueError:
-        logger.warning("Invalid REPORT_ADMIN_USER_ID: %r", REPORT_ADMIN_USER_ID)
-        return None
+    user_ids = get_report_admin_user_ids()
+    return user_ids[0] if user_ids else None
 
 
 def _is_admin_user(user_id: Optional[int]) -> bool:
-    admin_user_id = get_report_admin_user_id()
-    return user_id is not None and admin_user_id is not None and int(user_id) == admin_user_id
+    if user_id is None:
+        return False
+    return int(user_id) in set(get_report_admin_user_ids())
 
 
 def set_report_forward_chat_id(chat_id: int) -> None:
