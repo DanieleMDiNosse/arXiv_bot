@@ -1363,7 +1363,20 @@ def parse_keywords_input(raw: str) -> List[str]:
     if not raw:
         return []
 
-    if "," in raw:
+    multiline_items: List[str] = []
+    if "\n" in raw:
+        for line in raw.splitlines():
+            item = line.strip()
+            if not item:
+                continue
+            bullet_match = re.match(r"^[-*•]\s+(.*)$", item)
+            if bullet_match is not None:
+                item = bullet_match.group(1).strip()
+            multiline_items.append(item)
+
+    if len(multiline_items) > 1:
+        items = multiline_items
+    elif "," in raw:
         try:
             items = next(csv.reader([raw], skipinitialspace=True))
         except Exception:
@@ -3745,7 +3758,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "<b>Keyword Syntax</b>\n"
             "Use commas for separate alternatives (OR).\n"
             "Use <code>+</code> to search terms together (AND) in one keyword entry.\n"
-            'Example: <code>"quantum mechanics" + entanglement, superconductivity</code>.'
+            'Example: <code>quantum mechanics + entanglement, superconductivity</code>.'
         )
         await update.message.reply_text(
             welcome_text,
@@ -3810,9 +3823,10 @@ def build_help_text() -> str:
         f"• <b>{html.escape(MENU_BTN_SET_RECAP_TIME)}</b>: choose time zone and set one or more local recap times (HH:MM)\n"
         f"• <b>{html.escape(MENU_BTN_RECAP_STATUS)}</b>: show recap status and times\n\n"
         "<b>Keyword Syntax</b>\n"
-        "• Commas = separate alternatives (OR)\n"
+        "• Commas or separate lines = separate alternatives (OR)\n"
         "• <code>+</code> = terms searched together (AND) in one entry\n"
-        '• Example: <code>"quantum mechanics" + entanglement, superconductivity</code>\n\n'
+        '• Example: <code>"quantum mechanics" + entanglement, superconductivity</code>\n'
+        '• List example: <code>- quantum mechanics\n- entanglement + superconductivity</code>\n\n'
         "<b>Other</b>\n"
         f"• <b>{html.escape(MENU_BTN_HELP)}</b>: show this guide\n"
         f"• <b>{html.escape(MENU_BTN_REPORT)}</b>: report bugs or send feature requests\n"
@@ -4062,7 +4076,7 @@ async def keywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             + "\n\n".join(sections)
             + "\n\n"
             f"Use <b>{html.escape(MENU_BTN_SEARCH_HOURS)}</b> for a different time range.\n"
-            "Use commas for separate alternatives (OR). Use <code>+</code> to search terms together (AND) in one entry.\n"
+            "Use commas or one entry per line for separate alternatives (OR). Use <code>+</code> to search terms together (AND) in one entry.\n"
             'e.g. <code>"quantum mechanics" + entanglement, superconductivity</code>.',
             reply_markup=build_main_menu_markup(),
             parse_mode=ParseMode.HTML,
@@ -4087,10 +4101,11 @@ async def prompt_setkeywords_input(update: Update, context: ContextTypes.DEFAULT
     if update.message:
         await update.message.reply_text(
             "<b>Set Keywords</b>\n\n"
-            "Send a comma-separated list to apply to all sources.\n"
+            "Send a comma-separated list or one keyword per line to apply to all sources.\n"
             "Use <code>+</code> inside one entry to search terms together (AND), not separately.\n\n"
             "<b>Example</b>\n"
             "<code>astronomy, climate change + photosynthesis</code>\n\n"
+            "<code>- astronomy\n- climate change + photosynthesis</code>\n\n"
             f"To edit one source only, use <b>{html.escape(MENU_BTN_ADD_KEYWORDS)}</b> / "
             f"<b>{html.escape(MENU_BTN_REMOVE_KEYWORDS)}</b> / "
             f"<b>{html.escape(MENU_BTN_CLEAR_KEYWORDS)}</b>.",
@@ -4110,11 +4125,12 @@ async def prompt_add_keyword_for_source(
     text = (
         f"<b>Add Keywords • {html.escape(source_label)}</b>\n\n"
         "Send one or more keywords.\n"
-        "Separate entries with commas.\n\n"
+        "Separate entries with commas or send one per line.\n\n"
         "Use <code>+</code> inside one entry to search terms together (AND), not separately.\n\n"
         "<b>Examples</b>\n"
         "<code>quantum mechanics</code>\n"
         "<code>astronomy, climate change + photosynthesis</code>\n"
+        "<code>- astronomy\n- climate change + photosynthesis</code>\n"
         "<code>\"quantum mechanics\" + entanglement</code>"
     )
     if update.message:
@@ -4197,11 +4213,12 @@ async def prompt_remove_keyword_for_source(
     text = (
         f"<b>Remove Keywords • {html.escape(source_label)}</b>\n\n"
         "Send one or more saved keywords to remove.\n"
-        "Separate entries with commas.\n\n"
+        "Separate entries with commas or send one per line.\n\n"
         "<b>Current Keywords</b>\n"
         f"<pre>{body_html}</pre>\n"
         "<b>Examples</b>\n"
         "<code>astronomy</code>\n"
+        "<code>- astronomy\n- photosynthesis</code>\n"
         "<code>astronomy, photosynthesis</code>"
     )
     if update.message:
