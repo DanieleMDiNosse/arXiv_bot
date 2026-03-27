@@ -10,6 +10,7 @@ import math
 import os
 import re
 import shlex
+import sqlite3
 import time as systime
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -77,6 +79,7 @@ REPORT_FORWARD_CHAT_ID = os.getenv("REPORT_FORWARD_CHAT_ID", "").strip()
 REPORT_ADMIN_USER_ID = os.getenv("REPORT_ADMIN_USER_ID", "").strip()
 FEEDBACK_DAILY_LIMIT = 10
 SETTINGS_FILE = Path("bot_settings.json")
+METRICS_DB_FILE = Path("bot_metrics.sqlite3")
 MENU_BTN_TODAY = "Last 24h"
 MENU_BTN_KEYWORDS = "Keywords"
 MENU_BTN_ADD_KEYWORDS = "Add keywords"
@@ -237,6 +240,11 @@ def get_report_admin_user_id() -> Optional[int]:
         return None
 
 
+def _is_admin_user(user_id: Optional[int]) -> bool:
+    admin_user_id = get_report_admin_user_id()
+    return user_id is not None and admin_user_id is not None and int(user_id) == admin_user_id
+
+
 def set_report_forward_chat_id(chat_id: int) -> None:
     settings = load_settings()
     normalized = int(chat_id)
@@ -338,6 +346,13 @@ def save_settings(data: dict[str, Any]) -> None:
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _normalize_utc_datetime(now: Optional[datetime] = None) -> datetime:
+    reference = now if now is not None else datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return reference.astimezone(timezone.utc)
 
 
 def normalize_text(text: str) -> str:
@@ -443,10 +458,253 @@ def _save_user_setting(user_id: int, key: str, value: Any) -> None:
 
 
 def _utc_date_key(now: Optional[datetime] = None) -> str:
-    reference = now if now is not None else datetime.now(timezone.utc)
-    if reference.tzinfo is None:
-        reference = reference.replace(tzinfo=timezone.utc)
-    return reference.astimezone(timezone.utc).date().isoformat()
+    return _normalize_utc_datetime(now).date().isoformat()
+
+
+def _utc_timestamp_text(now: Optional[datetime] = None) -> str:
+    return _normalize_utc_datetime(now).isoformat(timespec="seconds")
+
+
+def _open_metrics_db() -> sqlite3.Connection:
+    connection = sqlite3.connect(METRICS_DB_FILE, timeout=30.0)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def _initialize_metrics_db() -> None:
+    with _open_metrics_db() as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                last_chat_id INTEGER,
+                last_username TEXT,
+                last_full_name TEXT,
+                recap_enabled INTEGER NOT NULL DEFAULT 0 CHECK (recap_enabled IN (0, 1))
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_activity_days (
+                user_id INTEGER NOT NULL,
+                activity_date TEXT NOT NULL,
+                PRIMARY KEY (user_id, activity_date),
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_activity_days_date
+            ON user_activity_days (activity_date)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_users_recap_enabled
+            ON users (recap_enabled)
+            """
+        )
+
+
+def _coerce_metrics_timestamp(raw_value: Any, *, fallback: Optional[datetime] = None) -> str:
+    fallback_dt = _normalize_utc_datetime(fallback)
+    if isinstance(raw_value, str):
+        cleaned = raw_value.strip()
+        if cleaned:
+            normalized = cleaned[:-1] + "+00:00" if cleaned.endswith("Z") else cleaned
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                parsed = None
+            if parsed is not None:
+                return _utc_timestamp_text(parsed)
+    return fallback_dt.isoformat(timespec="seconds")
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_user_interaction(
+    user_id: int,
+    *,
+    username: Optional[str] = None,
+    full_name: Optional[str] = None,
+    chat_id: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> None:
+    recorded_at = _utc_timestamp_text(now)
+    activity_date = _utc_date_key(now)
+    clean_username = normalize_text(username or "") or None
+    clean_full_name = normalize_text(full_name or "") or None
+
+    with _open_metrics_db() as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO users (
+                user_id,
+                first_seen_at,
+                last_seen_at,
+                last_chat_id,
+                last_username,
+                last_full_name,
+                recap_enabled
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 0)
+            """,
+            (user_id, recorded_at, recorded_at, chat_id, clean_username, clean_full_name),
+        )
+        connection.execute(
+            """
+            UPDATE users
+            SET last_seen_at = ?,
+                last_chat_id = ?,
+                last_username = ?,
+                last_full_name = ?
+            WHERE user_id = ?
+            """,
+            (recorded_at, chat_id, clean_username, clean_full_name, user_id),
+        )
+        # Keep one row per user per UTC day so DAU/WAU/MAU queries stay cheap
+        # without writing one activity event for every message or button press.
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO user_activity_days (user_id, activity_date)
+            VALUES (?, ?)
+            """,
+            (user_id, activity_date),
+        )
+
+
+def _set_metrics_recap_enabled(
+    user_id: int,
+    enabled: bool,
+    *,
+    chat_id: Optional[int] = None,
+    now: Optional[datetime] = None,
+    first_seen_at: Optional[str] = None,
+) -> None:
+    recorded_at = first_seen_at or _utc_timestamp_text(now)
+
+    with _open_metrics_db() as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO users (
+                user_id,
+                first_seen_at,
+                last_seen_at,
+                last_chat_id,
+                last_username,
+                last_full_name,
+                recap_enabled
+            )
+            VALUES (?, ?, ?, ?, NULL, NULL, ?)
+            """,
+            (user_id, recorded_at, recorded_at, chat_id, 1 if enabled else 0),
+        )
+        connection.execute(
+            """
+            UPDATE users
+            SET recap_enabled = ?,
+                last_chat_id = COALESCE(?, last_chat_id)
+            WHERE user_id = ?
+            """,
+            (1 if enabled else 0, chat_id, user_id),
+        )
+
+
+def _sync_metrics_users_from_settings() -> None:
+    settings = load_settings()
+    users = settings.get("users", {})
+    if not isinstance(users, dict):
+        return
+
+    fallback_now = _normalize_utc_datetime()
+    for user_id_str, user_settings in users.items():
+        try:
+            user_id = int(user_id_str)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(user_settings, dict):
+            continue
+
+        first_seen_at = _coerce_metrics_timestamp(
+            user_settings.get(WELCOME_SHOWN_AT_KEY),
+            fallback=fallback_now,
+        )
+        chat_id = _coerce_int(user_settings.get("daily_recap_chat_id"))
+        _set_metrics_recap_enabled(
+            user_id,
+            bool(user_settings.get("daily_recap_enabled", False)),
+            chat_id=chat_id,
+            first_seen_at=first_seen_at,
+        )
+
+
+def _get_user_metrics_summary(*, now: Optional[datetime] = None) -> dict[str, Any]:
+    reference_time = _normalize_utc_datetime(now)
+    today = reference_time.date()
+    wau_start = (today - timedelta(days=6)).isoformat()
+    mau_start = (today - timedelta(days=29)).isoformat()
+    today_key = today.isoformat()
+
+    with _open_metrics_db() as connection:
+        total_users = int(connection.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+        daily_active_users = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM user_activity_days
+                WHERE activity_date = ?
+                """,
+                (today_key,),
+            ).fetchone()[0]
+        )
+        weekly_active_users = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM user_activity_days
+                WHERE activity_date >= ?
+                """,
+                (wau_start,),
+            ).fetchone()[0]
+        )
+        monthly_active_users = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM user_activity_days
+                WHERE activity_date >= ?
+                """,
+                (mau_start,),
+            ).fetchone()[0]
+        )
+        recap_enabled_users = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM users
+                WHERE recap_enabled = 1
+                """
+            ).fetchone()[0]
+        )
+
+    return {
+        "total_users": total_users,
+        "daily_active_users": daily_active_users,
+        "weekly_active_users": weekly_active_users,
+        "monthly_active_users": monthly_active_users,
+        "recap_enabled_users": recap_enabled_users,
+        "as_of_utc": reference_time.isoformat(timespec="seconds"),
+    }
 
 
 def _coerce_feedback_daily_usage(value: Any, *, current_date: str) -> dict[str, Any]:
@@ -2798,6 +3056,53 @@ def render_expandable_abstract_html(abstract: str, max_chars: int = MAX_ABSTRACT
     return f"<blockquote expandable>{html.escape(cleaned)}</blockquote>"
 
 
+async def _send_fetch_status_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    hours_back: int,
+    scope: str,
+) -> Optional[tuple[int, int]]:
+    chat = update.effective_chat
+    if chat is None:
+        return None
+
+    status_text = (
+        f"Retrieving data from journals for {_describe_search_window(scope, hours_back)}.\n"
+        "This can take a few seconds."
+    )
+
+    try:
+        if update.message is not None:
+            sent_message = await update.message.reply_text(status_text)
+        else:
+            sent_message = await context.bot.send_message(
+                chat_id=chat.id,
+                text=status_text,
+            )
+    except Exception:
+        logger.exception("Could not send fetch status message")
+        return None
+
+    return int(chat.id), int(sent_message.message_id)
+
+
+async def _delete_temporary_bot_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    message_ref: Optional[tuple[int, int]],
+) -> None:
+    if message_ref is None:
+        return
+
+    chat_id, message_id = message_ref
+    try:
+        # Remove short-lived progress notices so the chat stays focused on the
+        # actual search results and not on transport status.
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        logger.debug("Could not delete temporary bot message %s in chat %s", message_id, chat_id)
+
+
 async def refresh_cache(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2862,218 +3167,235 @@ async def refresh_cache(
         bool(pubmed_query),
     )
 
-    arxiv_papers: List[Paper] = []
-    arxiv_request_url = ""
-    arxiv_raw_count = 0
-    biorxiv_papers: List[Paper] = []
-    biorxiv_request_url = ""
-    biorxiv_raw_count = 0
-    medrxiv_papers: List[Paper] = []
-    medrxiv_request_url = ""
-    medrxiv_raw_count = 0
-    chemrxiv_papers: List[Paper] = []
-    chemrxiv_request_url = ""
-    chemrxiv_raw_count = 0
-    ssrn_papers: List[Paper] = []
-    ssrn_request_url = ""
-    ssrn_raw_count = 0
-    ieee_papers: List[Paper] = []
-    ieee_request_url = ""
-    ieee_raw_count = 0
-    preprint_fetches: List[tuple[str, Any]] = []
-    if arxiv_query:
-        preprint_fetches.append(
-            (
-                SOURCE_ARXIV,
-                asyncio.to_thread(
-                    fetch_arxiv_entries,
-                    arxiv_query,
-                    DEFAULT_MAX_RESULTS,
-                    "lastUpdatedDate" if effective_scope == SEARCH_SCOPE_TODAY else "submittedDate",
-                ),
+    fetch_status_message = await _send_fetch_status_message(
+        update,
+        context,
+        hours_back=effective_hours_back,
+        scope=effective_scope,
+    )
+    try:
+        arxiv_papers: List[Paper] = []
+        arxiv_request_url = ""
+        arxiv_raw_count = 0
+        biorxiv_papers: List[Paper] = []
+        biorxiv_request_url = ""
+        biorxiv_raw_count = 0
+        medrxiv_papers: List[Paper] = []
+        medrxiv_request_url = ""
+        medrxiv_raw_count = 0
+        chemrxiv_papers: List[Paper] = []
+        chemrxiv_request_url = ""
+        chemrxiv_raw_count = 0
+        ssrn_papers: List[Paper] = []
+        ssrn_request_url = ""
+        ssrn_raw_count = 0
+        ieee_papers: List[Paper] = []
+        ieee_request_url = ""
+        ieee_raw_count = 0
+        preprint_fetches: List[tuple[str, Any]] = []
+        if arxiv_query:
+            preprint_fetches.append(
+                (
+                    SOURCE_ARXIV,
+                    asyncio.to_thread(
+                        fetch_arxiv_entries,
+                        arxiv_query,
+                        DEFAULT_MAX_RESULTS,
+                        "lastUpdatedDate" if effective_scope == SEARCH_SCOPE_TODAY else "submittedDate",
+                    ),
+                )
             )
-        )
-    if biorxiv_keywords:
-        preprint_fetches.append(
-            (
-                SOURCE_BIORXIV,
-                asyncio.to_thread(
-                    fetch_recent_rxiv_papers,
+        if biorxiv_keywords:
+            preprint_fetches.append(
+                (
                     SOURCE_BIORXIV,
-                    biorxiv_keywords,
-                    effective_hours_back,
-                    DEFAULT_MAX_RESULTS,
-                ),
+                    asyncio.to_thread(
+                        fetch_recent_rxiv_papers,
+                        SOURCE_BIORXIV,
+                        biorxiv_keywords,
+                        effective_hours_back,
+                        DEFAULT_MAX_RESULTS,
+                    ),
+                )
             )
-        )
-    if medrxiv_keywords:
-        preprint_fetches.append(
-            (
-                SOURCE_MEDRXIV,
-                asyncio.to_thread(
-                    fetch_recent_rxiv_papers,
+        if medrxiv_keywords:
+            preprint_fetches.append(
+                (
                     SOURCE_MEDRXIV,
-                    medrxiv_keywords,
-                    effective_hours_back,
-                    DEFAULT_MAX_RESULTS,
-                ),
+                    asyncio.to_thread(
+                        fetch_recent_rxiv_papers,
+                        SOURCE_MEDRXIV,
+                        medrxiv_keywords,
+                        effective_hours_back,
+                        DEFAULT_MAX_RESULTS,
+                    ),
+                )
             )
-        )
-    if chemrxiv_keywords:
-        preprint_fetches.append(
-            (
-                SOURCE_CHEMRXIV,
-                asyncio.to_thread(
-                    fetch_recent_chemrxiv_papers,
-                    chemrxiv_keywords,
-                    effective_hours_back,
-                    DEFAULT_MAX_RESULTS,
-                ),
+        if chemrxiv_keywords:
+            preprint_fetches.append(
+                (
+                    SOURCE_CHEMRXIV,
+                    asyncio.to_thread(
+                        fetch_recent_chemrxiv_papers,
+                        chemrxiv_keywords,
+                        effective_hours_back,
+                        DEFAULT_MAX_RESULTS,
+                    ),
+                )
             )
-        )
-    if ssrn_keywords:
-        preprint_fetches.append(
-            (
-                SOURCE_SSRN,
-                asyncio.to_thread(
-                    fetch_recent_ssrn_papers,
-                    ssrn_keywords,
-                    effective_hours_back,
-                    DEFAULT_MAX_RESULTS,
-                ),
+        if ssrn_keywords:
+            preprint_fetches.append(
+                (
+                    SOURCE_SSRN,
+                    asyncio.to_thread(
+                        fetch_recent_ssrn_papers,
+                        ssrn_keywords,
+                        effective_hours_back,
+                        DEFAULT_MAX_RESULTS,
+                    ),
+                )
             )
-        )
-    if ieee_keywords:
-        preprint_fetches.append(
-            (
-                SOURCE_IEEE,
-                asyncio.to_thread(
-                    fetch_recent_ieee_papers,
-                    ieee_keywords,
-                    effective_hours_back,
-                    DEFAULT_MAX_RESULTS,
-                ),
+        if ieee_keywords:
+            preprint_fetches.append(
+                (
+                    SOURCE_IEEE,
+                    asyncio.to_thread(
+                        fetch_recent_ieee_papers,
+                        ieee_keywords,
+                        effective_hours_back,
+                        DEFAULT_MAX_RESULTS,
+                    ),
+                )
             )
+        if preprint_fetches:
+            preprint_results = await asyncio.gather(
+                *(task for _source, task in preprint_fetches),
+                return_exceptions=True,
+            )
+            for (source, _task), result in zip(preprint_fetches, preprint_results):
+                if isinstance(result, Exception):
+                    logger.warning("%s fetch failed: %s", paper_source_label(source), result)
+                    continue
+                if source == SOURCE_ARXIV:
+                    entries, arxiv_request_url = result
+                    arxiv_raw_count = len(entries)
+                    if effective_scope == SEARCH_SCOPE_TODAY:
+                        arxiv_papers = entries_to_recent_papers(
+                            entries,
+                            TODAY_HOURS_BACK,
+                            use_updated=True,
+                        )
+                    else:
+                        arxiv_papers = entries_to_recent_papers(entries, effective_hours_back)
+                    continue
+                if source == SOURCE_BIORXIV:
+                    biorxiv_papers, biorxiv_request_url, biorxiv_raw_count = result
+                    continue
+                if source == SOURCE_MEDRXIV:
+                    medrxiv_papers, medrxiv_request_url, medrxiv_raw_count = result
+                    continue
+                if source == SOURCE_CHEMRXIV:
+                    chemrxiv_papers, chemrxiv_request_url, chemrxiv_raw_count = result
+                    continue
+                if source == SOURCE_SSRN:
+                    ssrn_papers, ssrn_request_url, ssrn_raw_count = result
+                    continue
+                if source == SOURCE_IEEE:
+                    ieee_papers, ieee_request_url, ieee_raw_count = result
+                    continue
+        pubmed_papers: List[Paper] = []
+        pubmed_request_url = ""
+        pubmed_raw_count = 0
+        if pubmed_query:
+            pubmed_papers, pubmed_request_url, pubmed_raw_count = await asyncio.to_thread(
+                fetch_recent_pubmed_papers,
+                pubmed_query,
+                effective_hours_back,
+                DEFAULT_MAX_RESULTS,
+            )
+
+        papers = (
+            arxiv_papers
+            + biorxiv_papers
+            + medrxiv_papers
+            + chemrxiv_papers
+            + ssrn_papers
+            + ieee_papers
+            + pubmed_papers
         )
-    if preprint_fetches:
-        preprint_results = await asyncio.gather(
-            *(task for _source, task in preprint_fetches),
-            return_exceptions=True,
+        papers.sort(
+            key=lambda paper: _paper_recency_timestamp(
+                paper,
+                prefer_updated_for_arxiv=effective_scope == SEARCH_SCOPE_TODAY,
+            ),
+            reverse=True,
         )
-        for (source, _task), result in zip(preprint_fetches, preprint_results):
-            if isinstance(result, Exception):
-                logger.warning("%s fetch failed: %s", paper_source_label(source), result)
-                continue
-            if source == SOURCE_ARXIV:
-                entries, arxiv_request_url = result
-                arxiv_raw_count = len(entries)
-                if effective_scope == SEARCH_SCOPE_TODAY:
-                    arxiv_papers = entries_to_recent_papers(
-                        entries,
-                        TODAY_HOURS_BACK,
-                        use_updated=True,
-                    )
-                else:
-                    arxiv_papers = entries_to_recent_papers(entries, effective_hours_back)
-                continue
-            if source == SOURCE_BIORXIV:
-                biorxiv_papers, biorxiv_request_url, biorxiv_raw_count = result
-                continue
-            if source == SOURCE_MEDRXIV:
-                medrxiv_papers, medrxiv_request_url, medrxiv_raw_count = result
-                continue
-            if source == SOURCE_CHEMRXIV:
-                chemrxiv_papers, chemrxiv_request_url, chemrxiv_raw_count = result
-                continue
-            if source == SOURCE_SSRN:
-                ssrn_papers, ssrn_request_url, ssrn_raw_count = result
-                continue
-            if source == SOURCE_IEEE:
-                ieee_papers, ieee_request_url, ieee_raw_count = result
-                continue
-    pubmed_papers: List[Paper] = []
-    pubmed_request_url = ""
-    pubmed_raw_count = 0
-    if pubmed_query:
-        pubmed_papers, pubmed_request_url, pubmed_raw_count = await asyncio.to_thread(
-            fetch_recent_pubmed_papers,
-            pubmed_query,
-            effective_hours_back,
-            DEFAULT_MAX_RESULTS,
+        for idx, paper in enumerate(papers, start=1):
+            paper.index = idx
+
+        query_lines: List[str] = []
+        if arxiv_query:
+            query_lines.append(f"arXiv: {arxiv_query}")
+        if biorxiv_keywords:
+            query_lines.append(f"bioRxiv keywords: {', '.join(biorxiv_keywords)}")
+        if medrxiv_keywords:
+            query_lines.append(f"medRxiv keywords: {', '.join(medrxiv_keywords)}")
+        if chemrxiv_keywords:
+            query_lines.append(f"ChemRxiv keywords: {', '.join(chemrxiv_keywords)}")
+        if ssrn_keywords:
+            query_lines.append(f"SSRN keywords: {', '.join(ssrn_keywords)}")
+        if ieee_keywords:
+            query_lines.append(f"IEEE keywords: {', '.join(ieee_keywords)}")
+        if pubmed_query:
+            query_lines.append(f"PubMed: {pubmed_query}")
+
+        request_lines: List[str] = []
+        if arxiv_request_url:
+            request_lines.append(f"arXiv: {arxiv_request_url}")
+        if biorxiv_request_url:
+            request_lines.append(f"bioRxiv: {biorxiv_request_url}")
+        if medrxiv_request_url:
+            request_lines.append(f"medRxiv: {medrxiv_request_url}")
+        if chemrxiv_request_url:
+            request_lines.append(f"ChemRxiv: {chemrxiv_request_url}")
+        if ssrn_request_url:
+            request_lines.append(f"SSRN: {ssrn_request_url}")
+        if ieee_request_url:
+            request_lines.append(f"IEEE: {ieee_request_url}")
+        if pubmed_request_url:
+            request_lines.append(f"PubMed: {pubmed_request_url}")
+
+        raw_breakdown = {
+            "arxiv": arxiv_raw_count,
+            "biorxiv": biorxiv_raw_count,
+            "medrxiv": medrxiv_raw_count,
+            "chemrxiv": chemrxiv_raw_count,
+            "ssrn": ssrn_raw_count,
+            "ieee": ieee_raw_count,
+            "pubmed": pubmed_raw_count,
+        }
+        raw_total = (
+            arxiv_raw_count
+            + biorxiv_raw_count
+            + medrxiv_raw_count
+            + chemrxiv_raw_count
+            + ssrn_raw_count
+            + ieee_raw_count
+            + pubmed_raw_count
         )
 
-    papers = arxiv_papers + biorxiv_papers + medrxiv_papers + chemrxiv_papers + ssrn_papers + ieee_papers + pubmed_papers
-    papers.sort(
-        key=lambda paper: _paper_recency_timestamp(
-            paper,
-            prefer_updated_for_arxiv=effective_scope == SEARCH_SCOPE_TODAY,
-        ),
-        reverse=True,
-    )
-    for idx, paper in enumerate(papers, start=1):
-        paper.index = idx
-
-    query_lines: List[str] = []
-    if arxiv_query:
-        query_lines.append(f"arXiv: {arxiv_query}")
-    if biorxiv_keywords:
-        query_lines.append(f"bioRxiv keywords: {', '.join(biorxiv_keywords)}")
-    if medrxiv_keywords:
-        query_lines.append(f"medRxiv keywords: {', '.join(medrxiv_keywords)}")
-    if chemrxiv_keywords:
-        query_lines.append(f"ChemRxiv keywords: {', '.join(chemrxiv_keywords)}")
-    if ssrn_keywords:
-        query_lines.append(f"SSRN keywords: {', '.join(ssrn_keywords)}")
-    if ieee_keywords:
-        query_lines.append(f"IEEE keywords: {', '.join(ieee_keywords)}")
-    if pubmed_query:
-        query_lines.append(f"PubMed: {pubmed_query}")
-
-    request_lines: List[str] = []
-    if arxiv_request_url:
-        request_lines.append(f"arXiv: {arxiv_request_url}")
-    if biorxiv_request_url:
-        request_lines.append(f"bioRxiv: {biorxiv_request_url}")
-    if medrxiv_request_url:
-        request_lines.append(f"medRxiv: {medrxiv_request_url}")
-    if chemrxiv_request_url:
-        request_lines.append(f"ChemRxiv: {chemrxiv_request_url}")
-    if ssrn_request_url:
-        request_lines.append(f"SSRN: {ssrn_request_url}")
-    if ieee_request_url:
-        request_lines.append(f"IEEE: {ieee_request_url}")
-    if pubmed_request_url:
-        request_lines.append(f"PubMed: {pubmed_request_url}")
-
-    raw_breakdown = {
-        "arxiv": arxiv_raw_count,
-        "biorxiv": biorxiv_raw_count,
-        "medrxiv": medrxiv_raw_count,
-        "chemrxiv": chemrxiv_raw_count,
-        "ssrn": ssrn_raw_count,
-        "ieee": ieee_raw_count,
-        "pubmed": pubmed_raw_count,
-    }
-    raw_total = (
-        arxiv_raw_count
-        + biorxiv_raw_count
-        + medrxiv_raw_count
-        + chemrxiv_raw_count
-        + ssrn_raw_count
-        + ieee_raw_count
-        + pubmed_raw_count
-    )
-
-    user_data["papers"] = papers
-    user_data["last_query"] = "\n".join(query_lines)
-    user_data["last_request_url"] = "\n".join(request_lines)
-    user_data["last_refresh_utc"] = datetime.now(timezone.utc)
-    user_data["last_raw_entry_count"] = raw_total
-    user_data["last_raw_entry_breakdown"] = raw_breakdown
-    user_data["cache_hours_back"] = effective_hours_back
-    user_data["cache_scope"] = effective_scope
-    user_data["results_token"] = int(user_data.get("results_token", 0) or 0) + 1
-    return papers
+        user_data["papers"] = papers
+        user_data["last_query"] = "\n".join(query_lines)
+        user_data["last_request_url"] = "\n".join(request_lines)
+        user_data["last_refresh_utc"] = datetime.now(timezone.utc)
+        user_data["last_raw_entry_count"] = raw_total
+        user_data["last_raw_entry_breakdown"] = raw_breakdown
+        user_data["cache_hours_back"] = effective_hours_back
+        user_data["cache_scope"] = effective_scope
+        user_data["results_token"] = int(user_data.get("results_token", 0) or 0) + 1
+        return papers
+    finally:
+        await _delete_temporary_bot_message(context, fetch_status_message)
 
 
 async def fetch_recent_papers_for_user(
@@ -3438,6 +3760,24 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def _track_user_metrics_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    user = update.effective_user
+    if user is None:
+        return
+
+    chat = update.effective_chat
+    try:
+        _record_user_interaction(
+            int(user.id),
+            username=user.username,
+            full_name=user.full_name,
+            chat_id=int(chat.id) if chat is not None else None,
+        )
+    except Exception:
+        logger.exception("Could not record metrics for user %s", user.id)
+
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(
@@ -3644,8 +3984,7 @@ async def setreporttarget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.message is None or chat is None or user is None:
         return
 
-    admin_user_id = get_report_admin_user_id()
-    if admin_user_id is None or int(user.id) != admin_user_id:
+    if not _is_admin_user(int(user.id)):
         await update.message.reply_text(
             "This command is not available to users.\n"
             "Configure REPORT_FORWARD_CHAT_ID on the server.",
@@ -3658,6 +3997,44 @@ async def setreporttarget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         "Set REPORT_FORWARD_CHAT_ID on the server.",
         parse_mode=ParseMode.HTML,
         reply_markup=build_main_menu_markup(),
+    )
+
+
+async def _userstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    message = update.message
+    user_id = _get_user_id(update)
+    if message is None:
+        return
+
+    if not _is_admin_user(user_id):
+        await message.reply_text(
+            "This command is not available to users.\n"
+            "Configure REPORT_ADMIN_USER_ID on the server.",
+            reply_markup=build_main_menu_markup(),
+        )
+        return
+
+    try:
+        metrics = _get_user_metrics_summary()
+    except Exception as exc:
+        logger.exception("Could not load user metrics")
+        await message.reply_text(
+            f"Could not load user metrics:\n{exc}",
+            reply_markup=build_main_menu_markup(),
+        )
+        return
+
+    await message.reply_text(
+        "<b>User Metrics</b>\n\n"
+        f"Total users ever seen: <b>{metrics['total_users']}</b>\n"
+        f"Daily active users (UTC): <b>{metrics['daily_active_users']}</b>\n"
+        f"Weekly active users (last 7 UTC days): <b>{metrics['weekly_active_users']}</b>\n"
+        f"Monthly active users (last 30 UTC days): <b>{metrics['monthly_active_users']}</b>\n"
+        f"Users with recap enabled: <b>{metrics['recap_enabled_users']}</b>\n\n"
+        f"As of: <code>{html.escape(str(metrics['as_of_utc']))}</code>",
+        reply_markup=build_main_menu_markup(),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -4887,6 +5264,7 @@ async def set_daily_recap_enabled(
     _save_user_setting(user_id, "daily_recap_time", recap_times[0])
     _save_user_setting(user_id, "daily_recap_timezone", recap_timezone)
     _save_user_setting(user_id, "daily_recap_chat_id", int(chat.id))
+    _set_metrics_recap_enabled(user_id, enabled, chat_id=int(chat.id))
 
     if enabled:
         try:
@@ -5659,6 +6037,8 @@ async def post_init(application: Application) -> None:
         await application.bot.delete_my_commands()
         await application.bot.set_chat_menu_button(menu_button=MenuButtonDefault())
 
+        _initialize_metrics_db()
+        _sync_metrics_users_from_settings()
         restore_daily_recap_jobs(application)
         logger.info("Startup initialization completed")
     except Exception:
@@ -5682,6 +6062,7 @@ def main() -> None:
 
     app = Application.builder().token(token).post_init(post_init).build()
 
+    app.add_handler(TypeHandler(Update, _track_user_metrics_callback), group=-1)
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("today", today_cmd))
@@ -5698,6 +6079,7 @@ def main() -> None:
     app.add_handler(CommandHandler("coffee", coffee_cmd))
     app.add_handler(CommandHandler("dailyrecap", dailyrecap_cmd))
     app.add_handler(CommandHandler("setrecaptime", setrecaptime_cmd))
+    app.add_handler(CommandHandler("userstats", _userstats_cmd))
     app.add_handler(CommandHandler("debugquery", debugquery_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_router))
