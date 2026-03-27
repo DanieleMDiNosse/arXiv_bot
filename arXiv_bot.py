@@ -75,6 +75,7 @@ REPORT_TEXT = os.getenv(
 ).strip() or "Report malfunctions or send feature requests"
 REPORT_FORWARD_CHAT_ID = os.getenv("REPORT_FORWARD_CHAT_ID", "").strip()
 REPORT_ADMIN_USER_ID = os.getenv("REPORT_ADMIN_USER_ID", "").strip()
+FEEDBACK_DAILY_LIMIT = 10
 SETTINGS_FILE = Path("bot_settings.json")
 MENU_BTN_TODAY = "Last 24h"
 MENU_BTN_KEYWORDS = "Keywords"
@@ -87,7 +88,7 @@ MENU_BTN_SET_RECAP_TIME = "Recap Time"
 MENU_BTN_RECAP_STATUS = "Recap Status"
 MENU_BTN_BOOKMARKS = "Bookmarks"
 MENU_BTN_HELP = "Help"
-MENU_BTN_REPORT = "Report issue"
+MENU_BTN_REPORT = "Feedback"
 MENU_BTN_COFFEE = "Pay me a coffee"
 SOURCE_ARXIV = "arxiv"
 SOURCE_BIORXIV = "biorxiv"
@@ -439,6 +440,105 @@ def _save_user_setting(user_id: int, key: str, value: Any) -> None:
         users.pop(str(user_id), None)
 
     save_settings(settings)
+
+
+def _utc_date_key(now: Optional[datetime] = None) -> str:
+    reference = now if now is not None else datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return reference.astimezone(timezone.utc).date().isoformat()
+
+
+def _coerce_feedback_daily_usage(value: Any, *, current_date: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"date": current_date, "count": 0}
+
+    raw_date = str(value.get("date", "")).strip()
+    try:
+        count = int(value.get("count", 0))
+    except (TypeError, ValueError):
+        count = 0
+
+    if count < 0:
+        count = 0
+
+    if raw_date != current_date:
+        return {"date": current_date, "count": 0}
+
+    return {"date": current_date, "count": count}
+
+
+def _get_feedback_daily_usage(
+    user_id: int,
+    user_data: Optional[dict[str, Any]] = None,
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    current_date = _utc_date_key(now)
+    cache_key = "feedback_daily_usage"
+
+    if user_data is not None and cache_key in user_data:
+        usage = _coerce_feedback_daily_usage(user_data[cache_key], current_date=current_date)
+        user_data[cache_key] = usage
+        return usage
+
+    settings = load_settings()
+    user_settings = _get_user_settings(settings, user_id)
+    usage = _coerce_feedback_daily_usage(
+        user_settings.get(cache_key),
+        current_date=current_date,
+    )
+    if user_data is not None:
+        user_data[cache_key] = usage
+    return usage
+
+
+def _remaining_feedback_slots(
+    user_id: int,
+    user_data: Optional[dict[str, Any]] = None,
+    *,
+    now: Optional[datetime] = None,
+) -> int:
+    usage = _get_feedback_daily_usage(user_id, user_data, now=now)
+    return max(0, FEEDBACK_DAILY_LIMIT - int(usage["count"]))
+
+
+def _record_feedback_submission(
+    user_id: int,
+    user_data: Optional[dict[str, Any]] = None,
+    *,
+    now: Optional[datetime] = None,
+) -> int:
+    current_date = _utc_date_key(now)
+    usage = _get_feedback_daily_usage(user_id, user_data, now=now)
+    updated = {
+        "date": current_date,
+        "count": min(FEEDBACK_DAILY_LIMIT, int(usage["count"]) + 1),
+    }
+    if user_data is not None:
+        user_data["feedback_daily_usage"] = updated
+    _save_user_setting(user_id, "feedback_daily_usage", updated)
+    return int(updated["count"])
+
+
+def _feedback_limit_reached_text() -> str:
+    return (
+        f"You have already sent {FEEDBACK_DAILY_LIMIT} feedback messages today. "
+        "Please try again tomorrow."
+    )
+
+
+def _get_feedback_submission_lock(application: Application, user_id: int) -> asyncio.Lock:
+    locks = application.bot_data.get("_feedback_submission_locks")
+    if not isinstance(locks, dict):
+        locks = {}
+        application.bot_data["_feedback_submission_locks"] = locks
+
+    lock = locks.get(user_id)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        locks[user_id] = lock
+    return lock
 
 
 def _unique_strings(values: Sequence[Any]) -> List[str]:
@@ -3440,10 +3540,18 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
+    user_id = _get_user_id(update)
+    if user_id is not None and _remaining_feedback_slots(user_id, context.user_data) <= 0:
+        await update.message.reply_text(
+            _feedback_limit_reached_text(),
+            reply_markup=build_main_menu_markup(),
+        )
+        return
+
     _clear_pending_input_flags(context)
     context.user_data["awaiting_report_input"] = True
     await update.message.reply_text(
-        "<b>Report Issue / Request</b>\n\n"
+        "<b>Report an issue or Request a new feature</b>\n\n"
         "Write your message and send it here.\n"
         "Your message will be forwarded to the maintainer.\n\n"
         "To cancel, press any other menu button.",
@@ -3471,42 +3579,57 @@ async def apply_report_input(
         )
         return False
 
-    target_chat_ids = get_report_forward_chat_ids()
-    if not target_chat_ids:
-        await message.reply_text(
-            "Report inbox is not configured yet on this bot.",
-            reply_markup=build_main_menu_markup(),
-        )
-        return False
+    user_id = int(user.id)
+    feedback_lock = _get_feedback_submission_lock(context.application, user_id)
 
-    username = f"@{user.username}" if user.username else "(no username)"
-    forwarded_text = (
-        "<b>New report/request</b>\n"
-        f"<b>From</b>: {html.escape(user.full_name)} ({html.escape(username)})\n"
-        f"<b>User ID</b>: <code>{user.id}</code>\n"
-        f"<b>Chat ID</b>: <code>{chat.id}</code>\n\n"
-        "<b>Message</b>\n"
-        f"{html.escape(report_text)}"
-    )
-
-    sent_count = 0
-    for target_chat_id in target_chat_ids:
-        try:
-            await context.bot.send_message(
-                chat_id=target_chat_id,
-                text=forwarded_text,
-                parse_mode=ParseMode.HTML,
+    # Serialize report submissions per user so the persisted daily cap remains
+    # accurate even if the user sends multiple feedback messages quickly.
+    async with feedback_lock:
+        if _remaining_feedback_slots(user_id, context.user_data) <= 0:
+            await message.reply_text(
+                _feedback_limit_reached_text(),
+                reply_markup=build_main_menu_markup(),
             )
-            sent_count += 1
-        except Exception:
-            logger.exception("Could not forward report message to %s", target_chat_id)
+            return False
 
-    if sent_count == 0:
-        await message.reply_text(
-            "Could not forward your message right now. Please try again later.",
-            reply_markup=build_main_menu_markup(),
+        target_chat_ids = get_report_forward_chat_ids()
+        if not target_chat_ids:
+            await message.reply_text(
+                "Report inbox is not configured yet on this bot.",
+                reply_markup=build_main_menu_markup(),
+            )
+            return False
+
+        username = f"@{user.username}" if user.username else "(no username)"
+        forwarded_text = (
+            "<b>New report/request</b>\n"
+            f"<b>From</b>: {html.escape(user.full_name)} ({html.escape(username)})\n"
+            f"<b>User ID</b>: <code>{user.id}</code>\n"
+            f"<b>Chat ID</b>: <code>{chat.id}</code>\n\n"
+            "<b>Message</b>\n"
+            f"{html.escape(report_text)}"
         )
-        return False
+
+        sent_count = 0
+        for target_chat_id in target_chat_ids:
+            try:
+                await context.bot.send_message(
+                    chat_id=target_chat_id,
+                    text=forwarded_text,
+                    parse_mode=ParseMode.HTML,
+                )
+                sent_count += 1
+            except Exception:
+                logger.exception("Could not forward report message to %s", target_chat_id)
+
+        if sent_count == 0:
+            await message.reply_text(
+                "Could not forward your message right now. Please try again later.",
+                reply_markup=build_main_menu_markup(),
+            )
+            return False
+
+        _record_feedback_submission(user_id, context.user_data)
 
     await message.reply_text(
         "Message sent. Thank you for the report.",
