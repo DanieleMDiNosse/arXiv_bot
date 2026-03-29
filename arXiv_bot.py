@@ -6316,11 +6316,6 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await action(update, context)
         return
 
-    if context.user_data.get("awaiting_keywords_input", False):
-        await apply_keywords_input(update, context, text)
-        context.user_data.pop("awaiting_keywords_input", None)
-        return
-
     if context.user_data.get("awaiting_add_keyword_source", False):
         source = str(context.user_data["awaiting_add_keyword_source"])
         await apply_keywords_input_for_source(
@@ -6331,6 +6326,7 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             mode="add",
         )
         context.user_data.pop("awaiting_add_keyword_source", None)
+        context.user_data.pop("awaiting_keywords_input", None)
         return
 
     if context.user_data.get("awaiting_remove_keyword_source", False):
@@ -6343,6 +6339,12 @@ async def menu_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             mode="remove",
         )
         context.user_data.pop("awaiting_remove_keyword_source", None)
+        context.user_data.pop("awaiting_keywords_input", None)
+        return
+
+    if context.user_data.get("awaiting_keywords_input", False):
+        await apply_keywords_input(update, context, text)
+        context.user_data.pop("awaiting_keywords_input", None)
         return
 
     if context.user_data.get("awaiting_search_hours_input", False) or context.user_data.get("awaiting_hours_input", False):
