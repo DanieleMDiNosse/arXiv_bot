@@ -1505,6 +1505,19 @@ def parse_single_keyword_input(raw: str) -> Optional[str]:
     return text
 
 
+def parse_full_text_search_input(raw: str) -> Optional[str]:
+    text = normalize_text(raw)
+    if not text:
+        return None
+
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = normalize_text(text[1:-1])
+
+    if not text:
+        return None
+    return text
+
+
 def ensure_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
@@ -1567,6 +1580,26 @@ def build_pubmed_query(keywords: Sequence[str]) -> Optional[str]:
         return None
 
     return "(" + " OR ".join(clauses) + ")"
+
+
+def build_arxiv_full_text_query(query_text: str) -> Optional[str]:
+    text = parse_full_text_search_input(query_text)
+    if not text:
+        return None
+    sanitized = text.replace('"', "").strip()
+    if not sanitized:
+        return None
+    return f'(ti:"{sanitized}" OR abs:"{sanitized}" OR all:"{sanitized}")'
+
+
+def build_pubmed_full_text_query(query_text: str) -> Optional[str]:
+    text = parse_full_text_search_input(query_text)
+    if not text:
+        return None
+    sanitized = text.replace('"', "").strip()
+    if not sanitized:
+        return None
+    return f'("{sanitized}"[Title/Abstract] OR "{sanitized}"[Text Word])'
 
 
 def _keywords_match_text(keywords: Sequence[str], text: str) -> bool:
@@ -1957,6 +1990,17 @@ def fetch_chemrxiv_papers(
     )
 
 
+def fetch_chemrxiv_papers_by_text(
+    query_text: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    return fetch_openalex_preprint_papers_by_text(
+        source=SOURCE_CHEMRXIV,
+        query_text=query_text,
+        max_results=max_results,
+    )
+
+
 def fetch_recent_ieee_papers(
     keywords: Sequence[str],
     hours_back: int,
@@ -1986,6 +2030,20 @@ def fetch_ieee_papers(
         keywords=keywords,
         hours_back=hours_back,
         query_text=query_text,
+        max_results=max_results,
+    )
+
+
+def fetch_ieee_papers_by_text(
+    query_text: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    return fetch_crossref_preprint_papers(
+        source=SOURCE_IEEE,
+        doi_prefix="10.1109",
+        keywords=[],
+        hours_back=None,
+        query_text=normalize_text(query_text),
         max_results=max_results,
     )
 
@@ -2205,10 +2263,11 @@ def fetch_openalex_preprint_papers(
     keywords: Sequence[str],
     hours_back: Optional[int] = None,
     max_results: int = DEFAULT_MAX_RESULTS,
+    search_query_override: str = "",
 ) -> tuple[list[Paper], str, int]:
     source_norm = str(source).casefold()
     source_id = OPENALEX_SOURCE_IDS.get(source_norm, "")
-    search_query = _keywords_to_openalex_search_query(keywords)
+    search_query = normalize_text(search_query_override) or _keywords_to_openalex_search_query(keywords)
     if not source_id or not search_query:
         return [], "", 0
 
@@ -2303,6 +2362,20 @@ def fetch_openalex_preprint_papers(
 
     request_url = "\n".join(request_urls)
     return papers, request_url, raw_count
+
+
+def fetch_openalex_preprint_papers_by_text(
+    source: str,
+    query_text: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    return fetch_openalex_preprint_papers(
+        source=source,
+        keywords=[],
+        hours_back=None,
+        max_results=max_results,
+        search_query_override=query_text,
+    )
 
 
 def _fetch_recent_openalex_preprint_papers(
@@ -2450,6 +2523,20 @@ def fetch_ssrn_papers(
         keywords=keywords,
         hours_back=hours_back,
         query_text=query_text,
+        max_results=max_results,
+    )
+
+
+def fetch_ssrn_papers_by_text(
+    query_text: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    return fetch_crossref_preprint_papers(
+        source=SOURCE_SSRN,
+        doi_prefix="10.2139",
+        keywords=[],
+        hours_back=None,
+        query_text=normalize_text(query_text),
         max_results=max_results,
     )
 
@@ -2749,6 +2836,20 @@ def fetch_pubmed_papers(
     return filtered, request_url, len(papers)
 
 
+def fetch_pubmed_papers_by_text(
+    query_text: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    query = build_pubmed_full_text_query(query_text)
+    if not query:
+        return [], "", 0
+    return fetch_pubmed_papers(
+        query=query,
+        hours_back=None,
+        max_results=max_results,
+    )
+
+
 def fetch_recent_pubmed_papers(
     query: str,
     hours_back: int,
@@ -2784,6 +2885,21 @@ def fetch_arxiv_entries(
 
     feed = feedparser.parse(response.text)
     return list(feed.entries), response.url
+
+
+def fetch_arxiv_papers_by_text(
+    query_text: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    query = build_arxiv_full_text_query(query_text)
+    if not query:
+        return [], "", 0
+    entries, request_url = fetch_arxiv_entries(
+        query=query,
+        max_results=max_results,
+        sort_by="submittedDate",
+    )
+    return entries_to_papers(entries), request_url, len(entries)
 
 
 def fetch_arxiv_entries_by_ids(arxiv_ids: Sequence[str]) -> tuple[list[Any], str]:
@@ -3559,6 +3675,152 @@ async def _fetch_papers_for_keywords_by_source(
     return papers, "\n".join(query_lines), "\n".join(request_lines), raw_total, raw_breakdown
 
 
+def _build_full_text_query_lines(query_text: str, selected_sources: Sequence[str]) -> List[str]:
+    normalized_query = parse_full_text_search_input(query_text)
+    normalized_sources = _normalize_global_search_sources(selected_sources)
+    if not normalized_query or not normalized_sources:
+        return []
+    return [
+        f'Global full-text: "{normalized_query}"',
+        f"Sources: {_global_search_sources_label(normalized_sources)}",
+    ]
+
+
+async def _fetch_papers_for_full_text_query(
+    *,
+    query_text: str,
+    selected_sources: Sequence[str],
+) -> tuple[list[Paper], str, str, int, dict[str, int]]:
+    normalized_query = parse_full_text_search_input(query_text) or ""
+    normalized_sources = _normalize_global_search_sources(selected_sources)
+    if not normalized_query or not normalized_sources:
+        return [], "", "", 0, _empty_raw_breakdown()
+
+    request_urls_by_source: dict[str, str] = {}
+    raw_breakdown = _empty_raw_breakdown()
+    papers_by_source: dict[str, list[Paper]] = {source: [] for source in keyword_sources()}
+
+    source_fetches: List[tuple[str, Any]] = []
+    if SOURCE_ARXIV in normalized_sources:
+        source_fetches.append(
+            (
+                SOURCE_ARXIV,
+                asyncio.to_thread(
+                    fetch_arxiv_papers_by_text,
+                    normalized_query,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if SOURCE_BIORXIV in normalized_sources:
+        source_fetches.append(
+            (
+                SOURCE_BIORXIV,
+                asyncio.to_thread(
+                    fetch_openalex_preprint_papers_by_text,
+                    SOURCE_BIORXIV,
+                    normalized_query,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if SOURCE_MEDRXIV in normalized_sources:
+        source_fetches.append(
+            (
+                SOURCE_MEDRXIV,
+                asyncio.to_thread(
+                    fetch_openalex_preprint_papers_by_text,
+                    SOURCE_MEDRXIV,
+                    normalized_query,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if SOURCE_CHEMRXIV in normalized_sources:
+        source_fetches.append(
+            (
+                SOURCE_CHEMRXIV,
+                asyncio.to_thread(
+                    fetch_chemrxiv_papers_by_text,
+                    normalized_query,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if SOURCE_SSRN in normalized_sources:
+        source_fetches.append(
+            (
+                SOURCE_SSRN,
+                asyncio.to_thread(
+                    fetch_ssrn_papers_by_text,
+                    normalized_query,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if SOURCE_IEEE in normalized_sources:
+        source_fetches.append(
+            (
+                SOURCE_IEEE,
+                asyncio.to_thread(
+                    fetch_ieee_papers_by_text,
+                    normalized_query,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+    if SOURCE_PUBMED in normalized_sources:
+        source_fetches.append(
+            (
+                SOURCE_PUBMED,
+                asyncio.to_thread(
+                    fetch_pubmed_papers_by_text,
+                    normalized_query,
+                    DEFAULT_MAX_RESULTS,
+                ),
+            )
+        )
+
+    if source_fetches:
+        source_results = await asyncio.gather(
+            *(task for _source, task in source_fetches),
+            return_exceptions=True,
+        )
+        for (source, _task), result in zip(source_fetches, source_results):
+            if isinstance(result, Exception):
+                logger.warning("%s full-text fetch failed: %s", paper_source_label(source), result)
+                continue
+            source_papers, request_url, raw_count = result
+            papers_by_source[source] = source_papers
+            request_urls_by_source[source] = request_url
+            raw_breakdown[source] = int(raw_count)
+
+    papers = [
+        paper
+        for source in keyword_sources()
+        if source in normalized_sources
+        for paper in papers_by_source.get(source, [])
+    ]
+    papers.sort(
+        key=lambda paper: _paper_recency_timestamp(
+            paper,
+            prefer_updated_for_arxiv=False,
+        ),
+        reverse=True,
+    )
+    for idx, paper in enumerate(papers, start=1):
+        paper.index = idx
+
+    query_lines = _build_full_text_query_lines(normalized_query, normalized_sources)
+    request_lines = [
+        f"{paper_source_label(source)}: {request_urls_by_source[source]}"
+        for source in keyword_sources()
+        if source in normalized_sources and request_urls_by_source.get(source)
+    ]
+    raw_total = sum(int(value) for value in raw_breakdown.values())
+    return papers, "\n".join(query_lines), "\n".join(request_lines), raw_total, raw_breakdown
+
+
 async def refresh_cache(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3998,13 +4260,13 @@ async def _prompt_global_search_query(
     text = (
         "<b>Global Search</b>\n\n"
         f"<b>Selected journals</b>: {html.escape(_global_search_sources_label(selected))}\n\n"
-        "Send your query now.\n"
-        "Use commas or separate lines for OR.\n"
-        "Use <code>+</code> inside one entry for AND.\n\n"
+        "Send one full-text query now.\n"
+        "The whole message is searched as one text query.\n"
+        "It is not split into keywords, commas, or <code>+</code> clauses.\n\n"
         "<b>Examples</b>\n"
         "<code>graph neural networks</code>\n"
-        "<code>quantum mechanics + entanglement, superconductivity</code>\n"
-        "<code>- llm safety\n- retrieval + benchmark</code>"
+        "<code>Attention Is All You Need</code>\n"
+        "<code>diffusion models for image generation</code>"
     )
     if chat is not None:
         await context.bot.send_message(
@@ -4034,18 +4296,14 @@ async def apply_global_search_query_input(
         _clear_global_search_state(context)
         return False
 
-    parsed_keywords = parse_keywords_input(raw)
-    if not parsed_keywords:
+    query_text_input = parse_full_text_search_input(raw)
+    if not query_text_input:
         await message.reply_text(
-            "No valid query terms found. Send at least one keyword or phrase.",
+            "No valid query text found. Send a title, phrase, or full-text query.",
             reply_markup=build_main_menu_markup(),
         )
         return False
 
-    keywords_by_source = {
-        source: list(parsed_keywords)
-        for source in selected_sources
-    }
     fetch_status_message = await _send_fetch_status_message(
         update,
         context,
@@ -4053,10 +4311,9 @@ async def apply_global_search_query_input(
         scope=SEARCH_SCOPE_GLOBAL,
     )
     try:
-        papers, query_text, request_text, raw_total, raw_breakdown = await _fetch_papers_for_keywords_by_source(
-            keywords_by_source=keywords_by_source,
-            hours_back=0,
-            scope=SEARCH_SCOPE_GLOBAL,
+        papers, query_text, request_text, raw_total, raw_breakdown = await _fetch_papers_for_full_text_query(
+            query_text=query_text_input,
+            selected_sources=selected_sources,
         )
     except Exception as exc:
         logger.exception("Global Search failed")
@@ -4084,8 +4341,9 @@ async def apply_global_search_query_input(
         await message.reply_text(
             (
                 f"No matching papers found in {_describe_search_window(SEARCH_SCOPE_GLOBAL, 0)}.\n\n"
+                f'Query: "{query_text_input}"\n'
                 f"Searched journals: {_global_search_sources_label(selected_sources)}.\n"
-                f"Review your query and try {MENU_BTN_GLOBAL_SEARCH} again."
+                f"Review your full-text query and try {MENU_BTN_GLOBAL_SEARCH} again."
             ),
             reply_markup=build_main_menu_markup(),
         )
@@ -4095,6 +4353,7 @@ async def apply_global_search_query_input(
         (
             f"{len(papers)} matching paper(s) found in "
             f"{_describe_search_window(SEARCH_SCOPE_GLOBAL, 0)}.\n"
+            f'Query: "{query_text_input}"\n'
             f"Searched journals: {_global_search_sources_label(selected_sources)}."
         ),
         reply_markup=build_main_menu_markup(),
