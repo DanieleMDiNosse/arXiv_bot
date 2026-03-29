@@ -49,6 +49,9 @@ PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 CROSSREF_WORKS_URL = "https://api.crossref.org/works"
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 DEFAULT_MAX_RESULTS = int(os.getenv("MAX_RESULTS", "300"))
+ARXIV_ID_LOOKUP_BATCH_SIZE = max(1, int(os.getenv("ARXIV_ID_LOOKUP_BATCH_SIZE", "25")))
+ARXIV_REQUEST_TIMEOUT = max(5, int(os.getenv("ARXIV_REQUEST_TIMEOUT", "30")))
+ARXIV_TIMEOUT_RETRIES = max(1, int(os.getenv("ARXIV_TIMEOUT_RETRIES", "2")))
 TODAY_HOURS_BACK = 24
 DAILY_RECAP_HOURS = 24
 RESULTS_PAGE_SIZE = max(1, int(os.getenv("RESULTS_PAGE_SIZE", "10")))
@@ -2902,7 +2905,51 @@ def fetch_arxiv_papers_by_text(
     return entries_to_papers(entries), request_url, len(entries)
 
 
-def fetch_arxiv_entries_by_ids(arxiv_ids: Sequence[str]) -> tuple[list[Any], str]:
+def fetch_arxiv_entries_by_ids(
+    arxiv_ids: Sequence[str],
+) -> tuple[list[Any], str, list[str]]:
+    ids = [paper_id.strip() for paper_id in arxiv_ids if isinstance(paper_id, str) and paper_id.strip()]
+    if not ids:
+        return [], "", []
+
+    pending_batches = [
+        ids[start:start + ARXIV_ID_LOOKUP_BATCH_SIZE]
+        for start in range(0, len(ids), ARXIV_ID_LOOKUP_BATCH_SIZE)
+    ]
+    entries: list[Any] = []
+    request_urls: list[str] = []
+    failed_ids: list[str] = []
+
+    while pending_batches:
+        batch = pending_batches.pop(0)
+        try:
+            batch_entries, request_url = _fetch_arxiv_entries_by_ids_batch(batch)
+        except requests.Timeout:
+            if len(batch) == 1:
+                logger.warning("arXiv bookmark lookup timed out for %s.", batch[0])
+                failed_ids.extend(batch)
+                continue
+            midpoint = max(1, len(batch) // 2)
+            logger.warning(
+                "arXiv bookmark lookup timed out for %s IDs. Retrying in smaller batches.",
+                len(batch),
+            )
+            pending_batches.insert(0, batch[midpoint:])
+            pending_batches.insert(0, batch[:midpoint])
+            continue
+        except requests.RequestException:
+            logger.exception("arXiv bookmark lookup failed for %s IDs", len(batch))
+            failed_ids.extend(batch)
+            continue
+
+        entries.extend(batch_entries)
+        if request_url:
+            request_urls.append(request_url)
+
+    return entries, " | ".join(request_urls), failed_ids
+
+
+def _fetch_arxiv_entries_by_ids_batch(arxiv_ids: Sequence[str]) -> tuple[list[Any], str]:
     ids = [paper_id.strip() for paper_id in arxiv_ids if isinstance(paper_id, str) and paper_id.strip()]
     if not ids:
         return [], ""
@@ -2912,12 +2959,28 @@ def fetch_arxiv_entries_by_ids(arxiv_ids: Sequence[str]) -> tuple[list[Any], str
         "max_results": len(ids),
     }
 
-    response = requests.get(
-        ARXIV_API_URL,
-        params=params,
-        timeout=30,
-        headers={"User-Agent": "telegram-arxiv-codex-bot/1.0"},
-    )
+    response: Optional[requests.Response] = None
+    for attempt in range(ARXIV_TIMEOUT_RETRIES):
+        try:
+            candidate = requests.get(
+                ARXIV_API_URL,
+                params=params,
+                timeout=ARXIV_REQUEST_TIMEOUT,
+                headers={"User-Agent": "telegram-arxiv-codex-bot/1.0"},
+            )
+        except requests.Timeout:
+            if attempt >= ARXIV_TIMEOUT_RETRIES - 1:
+                raise
+            wait_seconds = attempt + 1
+            logger.warning("arXiv bookmark lookup timed out for %s IDs. Retrying in %ss.", len(ids), wait_seconds)
+            systime.sleep(wait_seconds)
+            continue
+
+        response = candidate
+        break
+
+    if response is None:
+        raise RuntimeError("arXiv ID lookup did not return a response.")
     response.raise_for_status()
 
     feed = feedparser.parse(response.text)
@@ -3045,7 +3108,7 @@ async def fetch_papers_by_arxiv_ids(arxiv_ids: Sequence[str]) -> tuple[List[Pape
     if not requested_ids:
         return [], []
 
-    entries, _request_url = await asyncio.to_thread(fetch_arxiv_entries_by_ids, requested_ids)
+    entries, _request_url, failed_request_ids = await asyncio.to_thread(fetch_arxiv_entries_by_ids, requested_ids)
 
     exact_map: dict[str, Paper] = {}
     canonical_map: dict[str, Paper] = {}
@@ -3058,11 +3121,14 @@ async def fetch_papers_by_arxiv_ids(arxiv_ids: Sequence[str]) -> tuple[List[Pape
 
     ordered: List[Paper] = []
     missing: List[str] = []
+    failed_request_ids_set = set(failed_request_ids)
     for idx, requested_id in enumerate(requested_ids, start=1):
         paper = exact_map.get(requested_id)
         if paper is None:
             paper = canonical_map.get(canonical_arxiv_id(requested_id))
         if paper is None:
+            if requested_id in failed_request_ids_set:
+                logger.warning("Skipping unresolved arXiv bookmark after request timeout/failure: %s", requested_id)
             missing.append(requested_id)
             continue
         paper.index = idx
@@ -6701,8 +6767,13 @@ async def bookmarks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if not papers:
         if update.message:
+            missing_preview = ", ".join(missing[:5])
+            suffix = "..." if len(missing) > 5 else ""
+            details = ""
+            if missing:
+                details = f"\nCould not resolve {len(missing)} bookmark(s): {missing_preview}{suffix}"
             await update.message.reply_text(
-                "No bookmarked papers could be loaded right now.",
+                "No bookmarked papers could be loaded right now." + details,
                 reply_markup=build_main_menu_markup(),
             )
         return
