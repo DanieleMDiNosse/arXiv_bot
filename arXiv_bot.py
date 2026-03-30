@@ -42,16 +42,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ARXIV_API_URL = "http://export.arxiv.org/api/query"
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
 RXIV_DETAILS_API_URL = "https://api.biorxiv.org/details"
 PUBMED_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 CROSSREF_WORKS_URL = "https://api.crossref.org/works"
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
+OPENALEX_AUTOCOMPLETE_WORKS_URL = "https://api.openalex.org/autocomplete/works"
 DEFAULT_MAX_RESULTS = int(os.getenv("MAX_RESULTS", "300"))
+ARXIV_RATE_LIMIT_RETRIES = max(1, int(os.getenv("ARXIV_RATE_LIMIT_RETRIES", "3")))
+ARXIV_FULL_TEXT_MAX_RESULTS = max(1, min(DEFAULT_MAX_RESULTS, int(os.getenv("ARXIV_FULL_TEXT_MAX_RESULTS", "100"))))
 ARXIV_ID_LOOKUP_BATCH_SIZE = max(1, int(os.getenv("ARXIV_ID_LOOKUP_BATCH_SIZE", "25")))
 ARXIV_REQUEST_TIMEOUT = max(5, int(os.getenv("ARXIV_REQUEST_TIMEOUT", "30")))
 ARXIV_TIMEOUT_RETRIES = max(1, int(os.getenv("ARXIV_TIMEOUT_RETRIES", "2")))
+OPENALEX_AUTOCOMPLETE_MAX_CANDIDATES = max(1, int(os.getenv("OPENALEX_AUTOCOMPLETE_MAX_CANDIDATES", "8")))
 TODAY_HOURS_BACK = 24
 DAILY_RECAP_HOURS = 24
 RESULTS_PAGE_SIZE = max(1, int(os.getenv("RESULTS_PAGE_SIZE", "10")))
@@ -134,6 +138,7 @@ OPENALEX_SOURCE_IDS = {
     SOURCE_CHEMRXIV: "S4393918830",
     SOURCE_SSRN: "S4210172589",
 }
+OPENALEX_ARXIV_SOURCE_IDS = {"s4306400194", "s4393918464"}
 
 
 def build_main_menu_markup() -> ReplyKeyboardMarkup:
@@ -438,6 +443,10 @@ def _normalize_utc_datetime(now: Optional[datetime] = None) -> datetime:
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _text_lookup_key(text: str) -> str:
+    return normalize_text(text).casefold()
 
 
 def _list_available_recap_timezones() -> List[str]:
@@ -935,6 +944,36 @@ def paper_source_label(source: str) -> str:
     if source_norm == SOURCE_SSRN:
         return "SSRN"
     return "arXiv"
+
+
+def _retry_after_seconds(response: Optional[requests.Response], default_seconds: int = 3) -> int:
+    if response is None:
+        return max(1, int(default_seconds))
+    raw_value = str(response.headers.get("Retry-After", "")).strip()
+    if raw_value.isdigit():
+        return max(1, int(raw_value))
+    return max(1, int(default_seconds))
+
+
+def _http_status_code_from_error(exc: Exception) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    if isinstance(response, requests.Response):
+        return response.status_code
+    return None
+
+
+def _format_source_fetch_error(source: str, exc: Exception) -> str:
+    source_label = paper_source_label(source)
+    status_code = _http_status_code_from_error(exc)
+    if status_code == 429:
+        return f"{source_label} is rate-limiting requests right now. Try again in a minute."
+    if status_code is not None:
+        return f"{source_label} request failed with HTTP {status_code}."
+    if isinstance(exc, requests.Timeout):
+        return f"{source_label} request timed out."
+    if isinstance(exc, requests.RequestException):
+        return f"{source_label} request failed."
+    return f"{source_label} returned an unexpected error."
 
 
 def keyword_source_label(source: str) -> str:
@@ -2255,10 +2294,12 @@ def _openalex_abstract_from_inverted_index(raw: Any) -> str:
 
 
 def _openalex_item_to_preprint_paper(item: dict[str, Any], *, source: str) -> Optional[Paper]:
+    source_norm = normalize_text(source).casefold()
     doi_raw = normalize_text(str(item.get("doi") or ""))
     doi = doi_raw.removeprefix("https://doi.org/").removeprefix("http://doi.org/")
     doi = normalize_text(doi).strip()
-    if not doi:
+    arxiv_id = _arxiv_id_from_openalex_item(item) if source_norm == SOURCE_ARXIV else ""
+    if not doi and not arxiv_id:
         return None
 
     title = normalize_text(str(item.get("title") or "")) or "(untitled)"
@@ -2298,10 +2339,18 @@ def _openalex_item_to_preprint_paper(item: dict[str, Any], *, source: str) -> Op
         link_abs = normalize_text(str(primary_location.get("landing_page_url") or ""))
     if not link_abs and isinstance(best_oa_location, dict):
         link_abs = normalize_text(str(best_oa_location.get("landing_page_url") or ""))
-    if not link_abs:
+    if source_norm == SOURCE_ARXIV and arxiv_id and (
+        not link_abs
+        or "arxiv.org/" in link_abs.casefold()
+        or "10.48550/arxiv." in link_abs.casefold()
+    ):
+        link_abs = f"https://arxiv.org/abs/{arxiv_id}"
+    elif not link_abs and doi:
         link_abs = f"https://doi.org/{doi}"
-    if not link_pdf:
-        link_pdf = _guess_pdf_link_for_source(source=source, paper_id=doi, link_abs=link_abs)
+    if source_norm == SOURCE_ARXIV and arxiv_id and (not link_pdf or "arxiv.org/pdf/" in link_pdf.casefold()):
+        link_pdf = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    elif not link_pdf:
+        link_pdf = _guess_pdf_link_for_source(source=source_norm, paper_id=arxiv_id or doi, link_abs=link_abs)
 
     category = ""
     primary_topic = item.get("primary_topic")
@@ -2314,7 +2363,7 @@ def _openalex_item_to_preprint_paper(item: dict[str, Any], *, source: str) -> Op
 
     return Paper(
         index=0,
-        arxiv_id=doi,
+        arxiv_id=arxiv_id or doi,
         title=title,
         summary=summary,
         authors=authors,
@@ -2325,7 +2374,7 @@ def _openalex_item_to_preprint_paper(item: dict[str, Any], *, source: str) -> Op
         primary_category=category,
         link_abs=link_abs,
         link_pdf=link_pdf,
-        source=source,
+        source=source_norm,
     )
 
 
@@ -2368,10 +2417,109 @@ def _ieee_arnumber_from_url(url: str) -> str:
     return ""
 
 
+def _arxiv_id_from_text(raw: str) -> str:
+    token = normalize_text(raw)
+    if not token:
+        return ""
+
+    doi_match = re.search(r"10\.48550/arxiv\.([A-Za-z.\-]+/\d{7}|\d{4}\.\d{4,5})(v\d+)?", token, re.IGNORECASE)
+    if doi_match:
+        return doi_match.group(1) + (doi_match.group(2) or "")
+
+    url_match = re.search(r"arxiv\.org/(?:abs|pdf)/([A-Za-z.\-]+/\d{7}|\d{4}\.\d{4,5})(v\d+)?(?:\.pdf)?", token, re.IGNORECASE)
+    if url_match:
+        return url_match.group(1) + (url_match.group(2) or "")
+
+    direct_match = re.fullmatch(r"([A-Za-z.\-]+/\d{7}|\d{4}\.\d{4,5})(v\d+)?(?:\.pdf)?", token, re.IGNORECASE)
+    if direct_match:
+        return direct_match.group(1) + (direct_match.group(2) or "")
+
+    return ""
+
+
+def _openalex_source_id_key(raw: Any) -> str:
+    token = normalize_text(str(raw or "")).rstrip("/")
+    if not token:
+        return ""
+    return token.rsplit("/", 1)[-1].casefold()
+
+
+def _openalex_work_id_key(raw: Any) -> str:
+    token = normalize_text(str(raw or "")).rstrip("/")
+    if not token:
+        return ""
+    return token.rsplit("/", 1)[-1]
+
+
+def _openalex_item_has_arxiv_location(item: dict[str, Any]) -> bool:
+    indexed_in = item.get("indexed_in")
+    if isinstance(indexed_in, list) and any(_text_lookup_key(str(value or "")) == SOURCE_ARXIV for value in indexed_in):
+        return True
+
+    location_nodes: List[Any] = [item.get("primary_location"), item.get("best_oa_location")]
+    locations = item.get("locations")
+    if isinstance(locations, list):
+        location_nodes.extend(locations)
+
+    for location in location_nodes:
+        if not isinstance(location, dict):
+            continue
+        source_node = location.get("source")
+        if not isinstance(source_node, dict):
+            continue
+        source_id = _openalex_source_id_key(source_node.get("id"))
+        if source_id in OPENALEX_ARXIV_SOURCE_IDS:
+            return True
+        display_name = _text_lookup_key(str(source_node.get("display_name") or ""))
+        if "arxiv" in display_name:
+            return True
+
+    return bool(_arxiv_id_from_openalex_item(item))
+
+
+def _arxiv_id_from_openalex_item(item: dict[str, Any]) -> str:
+    candidates: List[str] = [
+        normalize_text(str(item.get("doi") or "")),
+    ]
+
+    ids_node = item.get("ids")
+    if isinstance(ids_node, dict):
+        candidates.append(normalize_text(str(ids_node.get("doi") or "")))
+
+    content_urls = item.get("content_urls")
+    if isinstance(content_urls, dict):
+        for value in content_urls.values():
+            candidates.append(normalize_text(str(value or "")))
+
+    location_nodes: List[Any] = [item.get("primary_location"), item.get("best_oa_location")]
+    locations = item.get("locations")
+    if isinstance(locations, list):
+        location_nodes.extend(locations)
+
+    for location in location_nodes:
+        if not isinstance(location, dict):
+            continue
+        candidates.append(normalize_text(str(location.get("landing_page_url") or "")))
+        candidates.append(normalize_text(str(location.get("pdf_url") or "")))
+
+    for candidate in candidates:
+        arxiv_id = _arxiv_id_from_text(candidate)
+        if arxiv_id:
+            return arxiv_id
+
+    return ""
+
+
 def _guess_pdf_link_for_source(*, source: str, paper_id: str, link_abs: str) -> str:
     source_norm = normalize_text(source).casefold()
     paper_id_norm = normalize_text(paper_id)
     link_abs_norm = normalize_text(link_abs)
+
+    if source_norm == SOURCE_ARXIV:
+        arxiv_id = _arxiv_id_from_text(paper_id_norm) or _arxiv_id_from_text(link_abs_norm)
+        if arxiv_id:
+            return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+        return ""
 
     if source_norm == SOURCE_SSRN:
         abstract_id = _ssrn_abstract_id_from_text(paper_id_norm) or _ssrn_abstract_id_from_url(link_abs_norm)
@@ -2442,6 +2590,99 @@ def _openalex_preprint_window_timestamp(paper: Paper) -> datetime:
     return paper.published
 
 
+def _openalex_get(
+    url: str,
+    *,
+    params: Optional[dict[str, Any]] = None,
+) -> requests.Response:
+    request_params = dict(params or {})
+    openalex_mailto = normalize_text(os.getenv("OPENALEX_MAILTO", ""))
+    if openalex_mailto:
+        request_params.setdefault("mailto", openalex_mailto)
+
+    response: Optional[requests.Response] = None
+    for attempt in range(3):
+        candidate = requests.get(
+            url,
+            params=request_params,
+            timeout=30,
+            headers={"User-Agent": "telegram-arxiv-codex-bot/1.0"},
+        )
+        response = candidate
+        if candidate.status_code != 429:
+            break
+        if attempt >= 2:
+            break
+        wait_seconds = _retry_after_seconds(candidate, default_seconds=2 * (attempt + 1))
+        logger.warning("OpenAlex rate-limited request. Retrying in %ss.", wait_seconds)
+        systime.sleep(wait_seconds)
+
+    if response is None:
+        raise RuntimeError("OpenAlex request did not return a response.")
+    response.raise_for_status()
+    return response
+
+
+def fetch_openalex_arxiv_title_fallback_papers(
+    query_text: str,
+    max_results: int = ARXIV_FULL_TEXT_MAX_RESULTS,
+) -> tuple[list[Paper], str, int]:
+    normalized_query = normalize_text(query_text)
+    if not normalized_query:
+        return [], "", 0
+
+    response = _openalex_get(
+        OPENALEX_AUTOCOMPLETE_WORKS_URL,
+        params={"q": normalized_query},
+    )
+    request_urls: List[str] = [response.url]
+    payload = response.json()
+    items = payload.get("results", [])
+    if not isinstance(items, list) or not items:
+        return [], " | ".join(request_urls), 0
+
+    candidate_ids: List[str] = []
+    seen_ids: set[str] = set()
+    query_key = _text_lookup_key(normalized_query)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if _text_lookup_key(str(item.get("display_name") or "")) != query_key:
+            continue
+        work_id = _openalex_work_id_key(item.get("id"))
+        if not work_id or work_id in seen_ids:
+            continue
+        seen_ids.add(work_id)
+        candidate_ids.append(work_id)
+        if len(candidate_ids) >= OPENALEX_AUTOCOMPLETE_MAX_CANDIDATES:
+            break
+
+    if not candidate_ids:
+        return [], " | ".join(request_urls), 0
+
+    papers: List[Paper] = []
+    seen_refs: set[str] = set()
+    for work_id in candidate_ids:
+        response = _openalex_get(f"{OPENALEX_WORKS_URL}/{work_id}")
+        request_urls.append(response.url)
+        item = response.json()
+        if not isinstance(item, dict) or not _openalex_item_has_arxiv_location(item):
+            continue
+        paper = _openalex_item_to_preprint_paper(item, source=SOURCE_ARXIV)
+        if paper is None or _text_lookup_key(paper.title) != query_key:
+            continue
+        ref = paper_ref_for(paper)
+        if ref in seen_refs:
+            continue
+        seen_refs.add(ref)
+        papers.append(paper)
+        if len(papers) >= max_results:
+            break
+
+    papers.sort(key=_openalex_preprint_window_timestamp, reverse=True)
+    return papers, " | ".join(request_urls), len(papers)
+
+
 def fetch_openalex_preprint_papers(
     source: str,
     keywords: Sequence[str],
@@ -2476,30 +2717,7 @@ def fetch_openalex_preprint_papers(
             "search": search_query,
         }
 
-        openalex_mailto = normalize_text(os.getenv("OPENALEX_MAILTO", ""))
-        if openalex_mailto:
-            params["mailto"] = openalex_mailto
-
-        response: Optional[requests.Response] = None
-        for attempt in range(3):
-            candidate = requests.get(
-                OPENALEX_WORKS_URL,
-                params=params,
-                timeout=30,
-                headers={"User-Agent": "telegram-arxiv-codex-bot/1.0"},
-            )
-            if candidate.status_code != 429:
-                response = candidate
-                break
-            # Respect rate limiting with a small exponential backoff.
-            wait_seconds = 2 * (attempt + 1)
-            logger.warning("OpenAlex rate-limited request. Retrying in %ss.", wait_seconds)
-            systime.sleep(wait_seconds)
-            response = candidate
-
-        if response is None:
-            break
-        response.raise_for_status()
+        response = _openalex_get(OPENALEX_WORKS_URL, params=params)
         payload = response.json()
         request_urls.append(response.url)
 
@@ -2606,30 +2824,7 @@ def fetch_recent_ssrn_papers_openalex(
         if search_query:
             params["search"] = search_query
 
-        openalex_mailto = normalize_text(os.getenv("OPENALEX_MAILTO", ""))
-        if openalex_mailto:
-            params["mailto"] = openalex_mailto
-
-        response: Optional[requests.Response] = None
-        for attempt in range(3):
-            candidate = requests.get(
-                OPENALEX_WORKS_URL,
-                params=params,
-                timeout=30,
-                headers={"User-Agent": "telegram-arxiv-codex-bot/1.0"},
-            )
-            if candidate.status_code != 429:
-                response = candidate
-                break
-            # Respect rate limiting with a small exponential backoff.
-            wait_seconds = 2 * (attempt + 1)
-            logger.warning("OpenAlex rate-limited request. Retrying in %ss.", wait_seconds)
-            systime.sleep(wait_seconds)
-            response = candidate
-
-        if response is None:
-            break
-        response.raise_for_status()
+        response = _openalex_get(OPENALEX_WORKS_URL, params=params)
         payload = response.json()
         request_urls.append(response.url)
 
@@ -3059,12 +3254,25 @@ def fetch_arxiv_entries(
         "sortOrder": "descending",
     }
 
-    response = requests.get(
-        ARXIV_API_URL,
-        params=params,
-        timeout=30,
-        headers={"User-Agent": "telegram-arxiv-codex-bot/1.0"},
-    )
+    response: Optional[requests.Response] = None
+    for attempt in range(ARXIV_RATE_LIMIT_RETRIES):
+        candidate = requests.get(
+            ARXIV_API_URL,
+            params=params,
+            timeout=ARXIV_REQUEST_TIMEOUT,
+            headers={"User-Agent": "telegram-arxiv-codex-bot/1.0"},
+        )
+        response = candidate
+        if candidate.status_code != 429:
+            break
+        if attempt >= ARXIV_RATE_LIMIT_RETRIES - 1:
+            break
+        wait_seconds = _retry_after_seconds(candidate, default_seconds=2 * (attempt + 1))
+        logger.warning("arXiv rate-limited request. Retrying in %ss.", wait_seconds)
+        systime.sleep(wait_seconds)
+
+    if response is None:
+        raise RuntimeError("arXiv request did not return a response.")
     response.raise_for_status()
 
     feed = feedparser.parse(response.text)
@@ -3073,16 +3281,32 @@ def fetch_arxiv_entries(
 
 def fetch_arxiv_papers_by_text(
     query_text: str,
-    max_results: int = DEFAULT_MAX_RESULTS,
+    max_results: int = ARXIV_FULL_TEXT_MAX_RESULTS,
 ) -> tuple[list[Paper], str, int]:
     query = build_arxiv_full_text_query(query_text)
     if not query:
         return [], "", 0
-    entries, request_url = fetch_arxiv_entries(
-        query=query,
-        max_results=max_results,
-        sort_by="submittedDate",
-    )
+    try:
+        entries, request_url = fetch_arxiv_entries(
+            query=query,
+            max_results=max_results,
+            sort_by="submittedDate",
+        )
+    except requests.HTTPError as exc:
+        if _http_status_code_from_error(exc) == 429:
+            logger.warning("arXiv export API rate-limited. Trying OpenAlex arXiv title fallback.")
+            try:
+                fallback_papers, fallback_request_url, fallback_count = fetch_openalex_arxiv_title_fallback_papers(
+                    query_text=query_text,
+                    max_results=max_results,
+                )
+            except Exception:
+                logger.exception("OpenAlex arXiv title fallback failed")
+            else:
+                if fallback_papers:
+                    logger.info("OpenAlex arXiv title fallback returned %s paper(s).", len(fallback_papers))
+                    return fallback_papers, fallback_request_url, fallback_count
+        raise
     return entries_to_papers(entries), request_url, len(entries)
 
 
@@ -3937,15 +4161,16 @@ async def _fetch_papers_for_full_text_query(
     *,
     query_text: str,
     selected_sources: Sequence[str],
-) -> tuple[list[Paper], str, str, int, dict[str, int]]:
+) -> tuple[list[Paper], str, str, int, dict[str, int], dict[str, str]]:
     normalized_query = parse_full_text_search_input(query_text) or ""
     normalized_sources = _normalize_global_search_sources(selected_sources)
     if not normalized_query or not normalized_sources:
-        return [], "", "", 0, _empty_raw_breakdown()
+        return [], "", "", 0, _empty_raw_breakdown(), {}
 
     request_urls_by_source: dict[str, str] = {}
     raw_breakdown = _empty_raw_breakdown()
     papers_by_source: dict[str, list[Paper]] = {source: [] for source in keyword_sources()}
+    source_errors: dict[str, str] = {}
 
     source_fetches: List[tuple[str, Any]] = []
     if SOURCE_ARXIV in normalized_sources:
@@ -4036,6 +4261,7 @@ async def _fetch_papers_for_full_text_query(
         for (source, _task), result in zip(source_fetches, source_results):
             if isinstance(result, Exception):
                 logger.warning("%s full-text fetch failed: %s", paper_source_label(source), result)
+                source_errors[source] = _format_source_fetch_error(source, result)
                 continue
             source_papers, request_url, raw_count = result
             papers_by_source[source] = source_papers
@@ -4065,7 +4291,7 @@ async def _fetch_papers_for_full_text_query(
         if source in normalized_sources and request_urls_by_source.get(source)
     ]
     raw_total = sum(int(value) for value in raw_breakdown.values())
-    return papers, "\n".join(query_lines), "\n".join(request_lines), raw_total, raw_breakdown
+    return papers, "\n".join(query_lines), "\n".join(request_lines), raw_total, raw_breakdown, source_errors
 
 
 async def refresh_cache(
@@ -4558,7 +4784,7 @@ async def apply_global_search_query_input(
         scope=SEARCH_SCOPE_GLOBAL,
     )
     try:
-        papers, query_text, request_text, raw_total, raw_breakdown = await _fetch_papers_for_full_text_query(
+        papers, query_text, request_text, raw_total, raw_breakdown, source_errors = await _fetch_papers_for_full_text_query(
             query_text=query_text_input,
             selected_sources=selected_sources,
         )
@@ -4584,13 +4810,36 @@ async def apply_global_search_query_input(
     )
     _clear_global_search_state(context)
 
+    failure_lines = [
+        source_errors[source]
+        for source in keyword_sources()
+        if source in selected_sources and source_errors.get(source)
+    ]
+    all_sources_failed = bool(failure_lines) and len(failure_lines) == len(selected_sources)
+
+    if all_sources_failed:
+        await message.reply_text(
+            (
+                "Global Search could not reach the selected sources right now.\n\n"
+                + "\n".join(f"- {line}" for line in failure_lines)
+                + f"\n\nQuery: \"{query_text_input}\"\n"
+                + f"Searched journals: {_global_search_sources_label(selected_sources)}."
+            ),
+            reply_markup=build_main_menu_markup(),
+        )
+        return True
+
     if not papers:
+        unavailable_text = ""
+        if failure_lines:
+            unavailable_text = "\n\nUnavailable sources:\n" + "\n".join(f"- {line}" for line in failure_lines)
         await message.reply_text(
             (
                 f"No matching papers found in {_describe_search_window(SEARCH_SCOPE_GLOBAL, 0)}.\n\n"
                 f'Query: "{query_text_input}"\n'
                 f"Searched journals: {_global_search_sources_label(selected_sources)}.\n"
                 f"Review your full-text query and try {MENU_BTN_GLOBAL_SEARCH} again."
+                f"{unavailable_text}"
             ),
             reply_markup=build_main_menu_markup(),
         )
@@ -4605,6 +4854,12 @@ async def apply_global_search_query_input(
         ),
         reply_markup=build_main_menu_markup(),
     )
+
+    if failure_lines:
+        await message.reply_text(
+            "Some sources were unavailable during this search:\n" + "\n".join(f"- {line}" for line in failure_lines),
+            reply_markup=build_main_menu_markup(),
+        )
 
     async def send_text(
         text: str,
