@@ -944,28 +944,179 @@ def keyword_source_label(source: str) -> str:
     return paper_source_label(source_norm)
 
 
-def get_bookmarks(
+def _serialize_bookmark_paper(paper: Paper) -> dict[str, Any]:
+    return {
+        "source": paper.source,
+        "arxiv_id": paper.arxiv_id,
+        "title": paper.title,
+        "summary": paper.summary,
+        "authors": list(paper.authors),
+        "published": ensure_utc(paper.published).isoformat(),
+        "updated": ensure_utc(paper.updated).isoformat(),
+        "published_raw": paper.published_raw,
+        "updated_raw": paper.updated_raw,
+        "primary_category": paper.primary_category,
+        "link_abs": paper.link_abs,
+        "link_pdf": paper.link_pdf,
+    }
+
+
+def _deserialize_bookmark_datetime(raw: Any) -> Optional[datetime]:
+    token = normalize_text(str(raw or ""))
+    if not token:
+        return None
+    try:
+        parsed = dateparser.parse(token)
+    except Exception:
+        return None
+    if parsed is None:
+        return None
+    return ensure_utc(parsed)
+
+
+def _deserialize_bookmark_paper(raw: Any, *, index: int = 0) -> Optional[Paper]:
+    if isinstance(raw, Paper):
+        return Paper(
+            index=index,
+            arxiv_id=raw.arxiv_id,
+            title=raw.title,
+            summary=raw.summary,
+            authors=list(raw.authors),
+            published=raw.published,
+            updated=raw.updated,
+            published_raw=raw.published_raw,
+            updated_raw=raw.updated_raw,
+            primary_category=raw.primary_category,
+            link_abs=raw.link_abs,
+            link_pdf=raw.link_pdf,
+            source=raw.source,
+        )
+
+    if not isinstance(raw, dict):
+        return None
+
+    source = normalize_text(str(raw.get("source") or SOURCE_ARXIV)).casefold()
+    if source not in ALL_PAPER_SOURCES:
+        source = SOURCE_ARXIV
+
+    paper_id = normalize_text(str(raw.get("arxiv_id") or raw.get("paper_id") or ""))
+    if not paper_id:
+        return None
+
+    published = _deserialize_bookmark_datetime(raw.get("published"))
+    updated = _deserialize_bookmark_datetime(raw.get("updated"))
+    if published is None or updated is None:
+        return None
+
+    authors_raw = raw.get("authors", [])
+    authors: List[str] = []
+    if isinstance(authors_raw, Sequence) and not isinstance(authors_raw, (str, bytes, bytearray)):
+        authors = [
+            normalize_text(str(author))
+            for author in authors_raw
+            if normalize_text(str(author))
+        ]
+
+    return Paper(
+        index=index,
+        arxiv_id=paper_id,
+        title=normalize_text(str(raw.get("title") or "")),
+        summary=normalize_text(str(raw.get("summary") or "")),
+        authors=authors,
+        published=published,
+        updated=updated,
+        published_raw=normalize_text(str(raw.get("published_raw") or "")),
+        updated_raw=normalize_text(str(raw.get("updated_raw") or "")),
+        primary_category=normalize_text(str(raw.get("primary_category") or "")),
+        link_abs=normalize_text(str(raw.get("link_abs") or "")),
+        link_pdf=normalize_text(str(raw.get("link_pdf") or "")),
+        source=source,
+    )
+
+
+def _bookmark_ref_from_value(value: Any) -> Optional[str]:
+    if isinstance(value, Paper):
+        return paper_ref_for(value)
+
+    if isinstance(value, dict):
+        raw_ref = value.get("ref")
+        if raw_ref is not None:
+            parsed = parse_paper_ref(str(raw_ref))
+            if parsed is not None:
+                return make_paper_ref(parsed[0], parsed[1])
+
+        nested_paper = _deserialize_bookmark_paper(value.get("paper"))
+        if nested_paper is not None:
+            return paper_ref_for(nested_paper)
+
+        embedded_paper = _deserialize_bookmark_paper(value)
+        if embedded_paper is not None:
+            return paper_ref_for(embedded_paper)
+        return None
+
+    parsed = parse_paper_ref(str(value))
+    if parsed is None:
+        return None
+    return make_paper_ref(parsed[0], parsed[1])
+
+
+def _bookmark_paper_payload_from_value(value: Any) -> Optional[dict[str, Any]]:
+    if isinstance(value, Paper):
+        return _serialize_bookmark_paper(value)
+
+    if not isinstance(value, dict):
+        return None
+
+    nested_paper = _deserialize_bookmark_paper(value.get("paper"))
+    if nested_paper is not None:
+        return _serialize_bookmark_paper(nested_paper)
+
+    embedded_paper = _deserialize_bookmark_paper(value)
+    if embedded_paper is not None:
+        return _serialize_bookmark_paper(embedded_paper)
+
+    return None
+
+
+def _normalize_bookmark_entries(
+    values: Sequence[Any],
+    *,
+    paper_payloads_by_ref: Optional[dict[str, dict[str, Any]]] = None,
+) -> List[dict[str, Any]]:
+    normalized: List[dict[str, Any]] = []
+    seen: set[str] = set()
+    preserved_payloads = dict(paper_payloads_by_ref or {})
+
+    for value in values:
+        ref = _bookmark_ref_from_value(value)
+        if ref is None or ref in seen:
+            continue
+
+        payload = preserved_payloads.get(ref)
+        if payload is None:
+            payload = _bookmark_paper_payload_from_value(value)
+
+        entry: dict[str, Any] = {"ref": ref}
+        if isinstance(payload, dict):
+            entry["paper"] = payload
+
+        seen.add(ref)
+        normalized.append(entry)
+
+    return normalized
+
+
+def get_bookmark_entries(
     user_data: Optional[dict[str, Any]] = None,
     user_id: Optional[int] = None,
-) -> List[str]:
-    def _normalize_bookmark_values(values: Sequence[Any]) -> List[str]:
-        normalized: List[str] = []
-        seen: set[str] = set()
-        for value in values:
-            parsed = parse_paper_ref(str(value))
-            if parsed is None:
-                continue
-            key = make_paper_ref(parsed[0], parsed[1])
-            if key in seen:
-                continue
-            seen.add(key)
-            normalized.append(key)
-        return normalized
-
+) -> List[dict[str, Any]]:
     if user_data is not None and "bookmarks" in user_data:
         cached = user_data["bookmarks"]
         if isinstance(cached, Sequence) and not isinstance(cached, (str, bytes, bytearray)):
-            return _normalize_bookmark_values(cached)
+            normalized = _normalize_bookmark_entries(cached)
+            user_data["bookmarks"] = normalized
+            return normalized
+        user_data["bookmarks"] = []
         return []
 
     if user_id is None:
@@ -975,34 +1126,64 @@ def get_bookmarks(
     user_settings = _get_user_settings(settings, user_id)
     bookmarks = user_settings.get("bookmarks", [])
     if not isinstance(bookmarks, Sequence) or isinstance(bookmarks, (str, bytes, bytearray)):
+        if user_data is not None:
+            user_data["bookmarks"] = []
         return []
 
-    cleaned = _normalize_bookmark_values(bookmarks)
+    cleaned = _normalize_bookmark_entries(bookmarks)
     if user_data is not None:
         user_data["bookmarks"] = cleaned
     return cleaned
+
+
+def get_bookmarks(
+    user_data: Optional[dict[str, Any]] = None,
+    user_id: Optional[int] = None,
+) -> List[str]:
+    return [entry["ref"] for entry in get_bookmark_entries(user_data, user_id)]
+
+
+def get_bookmarked_papers(
+    user_data: Optional[dict[str, Any]] = None,
+    user_id: Optional[int] = None,
+) -> List[Paper]:
+    papers: List[Paper] = []
+    for entry in get_bookmark_entries(user_data, user_id):
+        paper = _deserialize_bookmark_paper(entry.get("paper"), index=len(papers) + 1)
+        if paper is None:
+            continue
+        papers.append(paper)
+    return papers
 
 
 def set_bookmarks(
     user_id: int,
     bookmarks: Sequence[str],
     user_data: Optional[dict[str, Any]] = None,
+    *,
+    papers_by_ref: Optional[dict[str, Paper]] = None,
 ) -> List[str]:
-    cleaned: List[str] = []
-    seen: set[str] = set()
-    for value in bookmarks:
-        parsed = parse_paper_ref(str(value))
-        if parsed is None:
+    preserved_payloads: dict[str, dict[str, Any]] = {}
+    for entry in get_bookmark_entries(user_data, user_id):
+        payload = entry.get("paper")
+        ref = entry.get("ref")
+        if isinstance(ref, str) and isinstance(payload, dict):
+            preserved_payloads[ref] = payload
+
+    for raw_ref, paper in (papers_by_ref or {}).items():
+        ref = _bookmark_ref_from_value(raw_ref)
+        if ref is None or not isinstance(paper, Paper):
             continue
-        key = make_paper_ref(parsed[0], parsed[1])
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(key)
+        preserved_payloads[ref] = _serialize_bookmark_paper(paper)
+
+    cleaned_entries = _normalize_bookmark_entries(
+        bookmarks,
+        paper_payloads_by_ref=preserved_payloads,
+    )
     if user_data is not None:
-        user_data["bookmarks"] = cleaned
-    _save_user_setting(user_id, "bookmarks", cleaned if cleaned else None)
-    return cleaned
+        user_data["bookmarks"] = cleaned_entries
+    _save_user_setting(user_id, "bookmarks", cleaned_entries if cleaned_entries else None)
+    return [entry["ref"] for entry in cleaned_entries]
 
 
 def _get_user_id(update: Update) -> Optional[int]:
@@ -6680,6 +6861,7 @@ async def bookmark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer("Could not identify your Telegram user.", show_alert=True)
         return
 
+    paper = find_cached_paper_by_ref(context, source, paper_id)
     bookmarks = get_bookmarks(context.user_data, user_id=user_id)
     if paper_ref in bookmarks:
         bookmarks = [item for item in bookmarks if item != paper_ref]
@@ -6687,9 +6869,14 @@ async def bookmark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     else:
         bookmarks.append(paper_ref)
         is_bookmarked = True
-    set_bookmarks(user_id, bookmarks, context.user_data)
+    papers_by_ref = {paper_ref: paper} if is_bookmarked and paper is not None else None
+    set_bookmarks(
+        user_id,
+        bookmarks,
+        context.user_data,
+        papers_by_ref=papers_by_ref,
+    )
 
-    paper = find_cached_paper_by_ref(context, source, paper_id)
     reply_markup: Optional[InlineKeyboardMarkup] = None
     if query.message is not None:
         if paper is not None:
@@ -6731,41 +6918,37 @@ async def bookmarks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
         return
 
+    saved_by_ref = {
+        paper_ref_for(paper): paper
+        for paper in get_bookmarked_papers(context.user_data, user_id=user_id)
+    }
     cached_by_ref = {
         paper_ref_for(paper): paper
         for paper in context.user_data.get("papers", [])
         if isinstance(paper, Paper)
     }
-    resolved_from_cache: List[Paper] = []
-    unresolved_refs: List[str] = []
-    seen_refs: set[str] = set()
-    for ref in bookmark_ids:
-        if ref in seen_refs:
-            continue
-        seen_refs.add(ref)
-        cached = cached_by_ref.get(ref)
-        if cached is not None:
-            resolved_from_cache.append(cached)
-        else:
-            unresolved_refs.append(ref)
-
-    fetched: List[Paper] = []
+    papers: List[Paper] = []
     missing: List[str] = []
-    try:
-        if unresolved_refs:
-            fetched, missing = await fetch_papers_by_refs(unresolved_refs)
-    except Exception as exc:
-        logger.exception("Failed to fetch bookmarked papers")
-        if update.message:
-            await update.message.reply_text(
-                f"Could not load bookmarks:\n{exc}",
-                reply_markup=build_main_menu_markup(),
-            )
-        return
+    migrated_papers_by_ref: dict[str, Paper] = {}
+    for ref in bookmark_ids:
+        paper = saved_by_ref.get(ref)
+        if paper is None:
+            paper = cached_by_ref.get(ref)
+            if paper is not None:
+                migrated_papers_by_ref[ref] = paper
+        if paper is None:
+            missing.append(ref)
+            continue
+        paper.index = len(papers) + 1
+        papers.append(paper)
 
-    papers = resolved_from_cache + fetched
-    for idx, paper in enumerate(papers, start=1):
-        paper.index = idx
+    if migrated_papers_by_ref:
+        set_bookmarks(
+            user_id,
+            bookmark_ids,
+            context.user_data,
+            papers_by_ref=migrated_papers_by_ref,
+        )
 
     if not papers:
         if update.message:
@@ -6773,9 +6956,12 @@ async def bookmarks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             suffix = "..." if len(missing) > 5 else ""
             details = ""
             if missing:
-                details = f"\nCould not resolve {len(missing)} bookmark(s): {missing_preview}{suffix}"
+                details = (
+                    f"\nSome older bookmarks were stored as IDs only and were skipped: "
+                    f"{missing_preview}{suffix}"
+                )
             await update.message.reply_text(
-                "No bookmarked papers could be loaded right now." + details,
+                "No bookmarked papers are available right now." + details,
                 reply_markup=build_main_menu_markup(),
             )
         return
@@ -6793,7 +6979,10 @@ async def bookmarks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         missing_preview = ", ".join(missing[:5])
         suffix = "..." if len(missing) > 5 else ""
         await update.message.reply_text(
-            f"Could not resolve {len(missing)} bookmark(s): {missing_preview}{suffix}",
+            (
+                "Some older bookmarks were stored as IDs only and were skipped: "
+                f"{missing_preview}{suffix}"
+            ),
             reply_markup=build_main_menu_markup(),
         )
 
