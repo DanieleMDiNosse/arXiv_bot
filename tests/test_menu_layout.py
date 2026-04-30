@@ -15,18 +15,29 @@ def test_main_menu_uses_more_button_for_secondary_actions() -> None:
     assert bot.MENU_BTN_COFFEE not in labels
 
 
-def test_more_menu_contains_global_search_feedback_and_coffee_actions() -> None:
-    """The More submenu should expose Global Search plus the existing actions."""
+def test_more_menu_contains_feedback_and_coffee_actions() -> None:
+    """The More submenu should expose only actions that are currently enabled."""
     markup = bot.build_more_menu_markup()
     buttons = [button for row in markup.inline_keyboard for button in row]
 
+    if bot.GLOBAL_SEARCH_ENABLED:
+        assert [button.text for button in buttons] == [
+            bot.MENU_BTN_GLOBAL_SEARCH,
+            bot.MENU_BTN_REPORT,
+            bot.MENU_BTN_COFFEE,
+        ]
+        assert [button.callback_data for button in buttons] == [
+            "moremenu:globalsearch",
+            "moremenu:report",
+            "moremenu:coffee",
+        ]
+        return
+
     assert [button.text for button in buttons] == [
-        bot.MENU_BTN_GLOBAL_SEARCH,
         bot.MENU_BTN_REPORT,
         bot.MENU_BTN_COFFEE,
     ]
     assert [button.callback_data for button in buttons] == [
-        "moremenu:globalsearch",
         "moremenu:report",
         "moremenu:coffee",
     ]

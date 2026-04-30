@@ -31,6 +31,18 @@ def test_global_search_source_picker_marks_selected_sources() -> None:
     assert "bioRxiv" in labels
 
 
+def test_keyword_source_picker_marks_selected_sources_and_controls() -> None:
+    """Keyword source selection should support multi-select before continuing."""
+    markup = bot.build_keyword_scope_markup("add", [bot.SOURCE_ARXIV, bot.SOURCE_SSRN])
+    rows = markup.inline_keyboard
+
+    assert [button.text for button in rows[0]] == ["✅ arXiv", "bioRxiv"]
+    assert [button.text for button in rows[2]] == ["✅ SSRN", "IEEE"]
+    assert [button.text for button in rows[4]] == ["Select All", "Clear All"]
+    assert [button.text for button in rows[5]] == ["Continue", "Cancel"]
+    assert rows[5][0].callback_data == "kwmenu:start:add"
+
+
 def test_global_scope_description_and_pagination_keep_zero_hours() -> None:
     """Global searches should use an all-time label and preserve 0h in callbacks."""
     markup = bot.build_more_results_markup(
